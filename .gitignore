@@ -1,0 +1,10 @@
+.venv/
+.data/
+.next/
+node_modules/
+tsconfig.tsbuildinfo
+analysis/output/
+analysis/cache/
+__pycache__/
+*.pyc
+.DS_Store
