@@ -44,6 +44,14 @@ npm run verify:release
 
 The demo uses deterministic synthetic data. It does not connect to a venue, place orders, use customer data, or provide trading advice.
 
+## Check twin parameter recovery
+
+```bash
+npm run twin:recovery
+```
+
+Fits twin-0.2.0 (`docs/MODEL_CARD.md`) to a SYNTHETIC population with known parameters and prints a short summary. The full results go to `analysis/output/twin-recovery/`, which is gitignored. Recovery numbers stay in that local output.
+
 ## Run the web application
 
 Set `DATABASE_URL`, `NEON_AUTH_BASE_URL`, and `NEON_AUTH_COOKIE_SECRET` in the local environment, then run:
@@ -72,3 +80,4 @@ The holdout analysis uses the main [Polymarket users dataset](https://huggingfac
 - `docs/DECISIONS.md` records architecture decisions.
 - `docs/RISK_REGISTER.md` records delivery risks.
 - `db/schema.sql` contains the PostgreSQL schema.
+- `db/migrations/` contains numbered, additive SQL migrations, applied in order after `db/schema.sql`. Change the schema with a new migration, never by editing `db/schema.sql`.

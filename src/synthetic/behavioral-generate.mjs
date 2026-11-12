@@ -172,7 +172,8 @@ export const DEFAULT_GENERATOR_OPTIONS = deepFreeze({
   tradersPerArchetype: 1,
   traderCount: 100,
   traders: [],
-  // A positive integer, or { min, max } for a uniform integer draw per trader.
+  // A positive integer, or { min, max } for a uniform integer draw per trader. Add
+  // scale: 'log' for a log-uniform draw, which gives many short histories.
   sessionsPerTrader: 100,
   // false leaves balance_before and balance_after out of every event. Balances are still simulated.
   includeBalances: true,
@@ -243,11 +244,30 @@ function validateParameters(parameters, label) {
   requireNumber(p.sessionsPerDay, `${label}.sessionsPerDay`, { min: 0, exclusiveMin: true });
 }
 
+const SESSION_SCALES = Object.freeze(['uniform', 'log']);
+
 function validateSessionsSpec(spec, label) {
   if (isPositiveInteger(spec)) return;
   if (isPlainObject(spec) && isPositiveInteger(spec.min) && isPositiveInteger(spec.max) && spec.min <= spec.max
-    && Object.keys(spec).every((key) => key === 'min' || key === 'max')) return;
-  fail(`${label} must be a positive integer or { min, max } with positive integers min <= max`);
+    && (spec.scale === undefined || SESSION_SCALES.includes(spec.scale))
+    && Object.keys(spec).every((key) => ['min', 'max', 'scale'].includes(key))) return;
+  fail(`${label} must be a positive integer or { min, max, scale? } with positive integers min <= max and scale ${SESSION_SCALES.join(' or ')}`);
+}
+
+/**
+ * One trader's session count. { min, max } (scale 'uniform', the default) is a
+ * uniform integer draw. scale 'log' is log-uniform: floor(exp(U(log min,
+ * log(max + 1)))), so each count k has probability log((k + 1) / k) /
+ * log((max + 1) / min) and short histories are common. Each uses one draw.
+ */
+function drawSessionCount(spec, rng) {
+  if (isPositiveInteger(spec)) return spec;
+  if (spec.scale === 'log') {
+    const logMin = Math.log(spec.min);
+    const count = Math.floor(Math.exp(logMin + rng.next() * (Math.log(spec.max + 1) - logMin)));
+    return clamp(count, spec.min, spec.max);
+  }
+  return rng.integer(spec.min, spec.max);
 }
 
 function resolveBehaviorOptions(supplied) {
@@ -620,8 +640,7 @@ export function generateBehavioralDataset(options = {}) {
     // Separate streams per trader and purpose: adding traders or blanking outcomes never changes another stream.
     const parameterRng = createRng(stableSeed(`${seed}:parameters:${index}`));
     const parameters = spec.parameters ?? drawPopulationParameters(parameterRng);
-    const sessions = resolved.sessionsPerTrader;
-    const sessionCount = isPositiveInteger(sessions) ? sessions : parameterRng.integer(sessions.min, sessions.max);
+    const sessionCount = drawSessionCount(resolved.sessionsPerTrader, parameterRng);
     return {
       index,
       traderToken: `syn_${String(index + 1).padStart(width, '0')}`,

@@ -401,6 +401,25 @@ test('population mode: enough sessions per trader gives every trader 20+ loss ep
   }
 });
 
+test('sessionsPerTrader with scale "log" gives many short histories, and uniform draws are unchanged', () => {
+  const base = { seed: 13, mode: 'population', traderCount: 40, sessionsPerTrader: { min: 2, max: 9 } };
+  const uniform = generateBehavioralDataset(base);
+  assert.deepEqual(generateBehavioralDataset({ ...base, sessionsPerTrader: { min: 2, max: 9, scale: 'uniform' } }).events, uniform.events);
+
+  const { truth } = generateBehavioralDataset({ seed: 13, mode: 'population', traderCount: 300, sessionsPerTrader: { min: 2, max: 150, scale: 'log' } });
+  assert.deepEqual(truth.options.sessionsPerTrader, { min: 2, max: 150, scale: 'log' });
+  const counts = truth.traders.map((trader) => trader.sessionCount);
+  assert.ok(counts.every((count) => Number.isInteger(count) && count >= 2 && count <= 150));
+  // Log-uniform: P(count <= 10) = log(11 / 2) / log(151 / 2), about 0.39. Uniform would give about 0.06.
+  const shortShare = counts.filter((count) => count <= 10).length / counts.length;
+  assert.ok(shortShare > 0.3 && shortShare < 0.5, `share with 10 or fewer sessions: ${shortShare}`);
+  assert.ok(counts.some((count) => count >= 100));
+
+  const rejects = (sessionsPerTrader) => assert.throws(() => generateBehavioralDataset({ sessionsPerTrader }), RangeError);
+  rejects({ min: 2, max: 9, scale: 'logarithmic' });
+  rejects({ min: 2, max: 9, kind: 'log' });
+});
+
 test('custom traders override archetype parameters, and invalid input is rejected', () => {
   const { truth } = generateBehavioralDataset({
     mode: 'custom',

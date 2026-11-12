@@ -103,6 +103,10 @@ Every signal also needs `trader_token`, `occurred_at`, and the event type. The e
 | `losingStreakLength` | 3 | 5 |
 | `observationEnd` | latest event time | 4, 5 |
 
+### Observations
+
+`buildBehaviorObservations(events, options)` takes the same options and returns, per trader, the observations every signal summarizes: per trade (stake, outcome, previous outcome, same-session losing run, running session result, whether the session ended after it, censoring, balances), deposits with times, signal-1 episodes by side, latencies by outcome, signal-6 points with a run id, and losing-streak refuel episodes. `buildBehaviorSignals` is a summary of these same observations. `lowBalanceRefuelEpisodes(record, threshold)` gives signal 5's low-balance episodes for any threshold. The twin-0.2.0 estimator reads the observations, so it never re-implements a signal definition (`docs/MODEL_CARD.md`).
+
 ## Prohibited analytical fields
 
 - Name

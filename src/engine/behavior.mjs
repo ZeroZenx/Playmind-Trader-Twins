@@ -9,6 +9,13 @@
  * give the same output, whatever the input order. Field needs and definitions
  * are in docs/DATA-DICTIONARY.md ("Behavioral signals"). ADR-009 in
  * docs/DECISIONS.md explains why signals 1 and 6 use disjoint post-loss trades.
+ *
+ * Two entry points share one set of definitions:
+ * - buildBehaviorObservations returns each trader's per-trade, per-deposit, and
+ *   per-episode observations (the inputs to every signal, before any summary).
+ * - buildBehaviorSignals summarizes those same observations into signal values.
+ * The twin estimator (estimate.mjs) reads the observations, so it never
+ * re-implements a signal definition.
  */
 
 export const BEHAVIOR_VERSION = 'behavior-0.2.0';
@@ -108,10 +115,6 @@ function compareText(a, b) {
 
 // --- Options -----------------------------------------------------------------
 
-function check(condition, message) {
-  if (!condition) throw new RangeError(`buildBehaviorSignals: ${message}`);
-}
-
 function isPositiveInteger(value) {
   return Number.isInteger(value) && value >= 1;
 }
@@ -122,7 +125,10 @@ function parseTime(value) {
   return Date.parse(value);
 }
 
-function resolveOptions(options, latestEventMs) {
+function resolveOptions(options, latestEventMs, caller) {
+  const check = (condition, message) => {
+    if (!condition) throw new RangeError(`${caller}: ${message}`);
+  };
   const supplied = Object.fromEntries(Object.entries(options ?? {}).filter(([, value]) => value !== undefined));
   for (const key of Object.keys(supplied)) {
     check(Object.hasOwn(DEFAULT_BEHAVIOR_OPTIONS, key), `unknown option "${key}"`);
@@ -228,6 +234,7 @@ function structure(rows, options) {
     const outcome = outcomeOf(result);
     const previous = session.trades.at(-1);
     const trade = {
+      index: trades.length,
       action,
       t: row.t,
       session: session.index,
@@ -313,12 +320,27 @@ export function drawdownBucket(runningResult, medianStake, options = {}) {
   return 'down_large';
 }
 
-// --- Signal 1: post-outcome stake response ----------------------------------
+// --- Observations ------------------------------------------------------------
+//
+// Each observe* function collects, in event order, the episodes one signal is
+// built from. The matching *Signal function further down only summarizes them.
 
-function postOutcomeStakeSignal(trades, context) {
-  const { options } = context;
-  const minimum = minimumFor('postOutcomeStake', options);
-  const ratios = { loss: [], win: [] };
+function isRefuelDeposit(action) {
+  // A deposit recorded with an observed zero amount moved no money, so it is not a refuel.
+  return action.type === 'deposit' && !(isFiniteNumber(action.event.deposit_amount) && action.event.deposit_amount <= 0);
+}
+
+function depositAmountOf(event) {
+  if (isFiniteNumber(event.deposit_amount)) return event.deposit_amount;
+  if (hasBalances(event)) return event.balance_after - event.balance_before;
+  return null;
+}
+
+// Signal 1: the trade after a realized loss or win, divided by the median of up to
+// rollingWindow previous usable stakes. A trade after the second or later loss of a
+// same-session losing run belongs to signal 6 instead (ADR-009).
+function observePostOutcomeStake(trades, options) {
+  const episodes = { loss: [], win: [] };
   const excluded = { missingOutcome: 0, push: 0, missingStake: 0, insufficientHistory: 0, escalationPosition: 0 };
   const history = [];
 
@@ -334,40 +356,19 @@ function postOutcomeStakeSignal(trades, context) {
       } else {
         const prior = history.slice(-options.rollingWindow);
         if (prior.length < options.minStakeHistory) excluded.insufficientHistory += 1;
-        else ratios[trigger.outcome].push(response.stake / median(prior));
+        else {
+          const ratio = response.stake / median(prior);
+          episodes[trigger.outcome].push({ trigger: trigger.index, response: response.index, ratio, logRatio: Math.log(ratio) });
+        }
       }
     }
     if (response.stake !== null) history.push(response.stake);
   }
-
-  const summarize = (values, side) => gated(
-    values.length,
-    minimum,
-    context.hasOutcomes ? `no realized ${side} followed by a trade with a usable stake and stake history` : 'realized_result unavailable for every trade',
-    () => ({ value: median(values), meanLogRatio: mean(values.map(Math.log)) }),
-    { meanLogRatio: null }
-  );
-  const afterLoss = summarize(ratios.loss, 'loss');
-  const afterWin = summarize(ratios.win, 'win');
-  const lossMinusWin = difference(afterLoss, afterWin);
-
-  return {
-    afterLoss,
-    afterWin,
-    lossMinusWin: {
-      value: lossMinusWin.value,
-      logRatioDifference: lossMinusWin.value === null ? null : afterLoss.meanLogRatio - afterWin.meanLogRatio,
-      n: lossMinusWin.n,
-      reason: lossMinusWin.reason
-    },
-    excluded
-  };
+  return { ...episodes, excluded };
 }
 
-// --- Signal 2: re-entry latency ---------------------------------------------
-
-function reentryLatencySignal(trades, context) {
-  const minimum = minimumFor('reentryLatency', context.options);
+// Signal 2: minutes from a realized loss or win to the trader's next trade.
+function observeReentryLatency(trades) {
   const anySession = { loss: [], win: [] };
   const withinSession = { loss: [], win: [] };
   const excluded = { missingOutcome: 0, push: 0, noNextTrade: 0 };
@@ -381,6 +382,221 @@ function reentryLatencySignal(trades, context) {
     anySession[trigger.outcome].push(minutes);
     if (next.session === trigger.session) withinSession[trigger.outcome].push(minutes);
   });
+  return { anySession, withinSession, excluded };
+}
+
+// Signal 5, one trigger trade: was there a refuel deposit within the window after it?
+function refuelEpisode(trade, deposits, windowMs, observationEndMs) {
+  // The full window must be observed, or a missing deposit could just be past the data's end.
+  const censored = observationEndMs - trade.t < windowMs;
+  return {
+    trade: trade.index,
+    t: trade.t,
+    censored,
+    refueled: censored
+      ? null
+      : deposits.some((deposit) => deposit.refuel && deposit.action > trade.action && deposit.t - trade.t <= windowMs)
+  };
+}
+
+// Signal 5, losing-streak trigger: the trade that completes K consecutive realized losses.
+// A refuel deposit, win, push, or missing outcome resets the count.
+function observeLosingStreaks(actions, trades, deposits, options, observationEndMs) {
+  const windowMs = options.refuelWindowMinutes * MINUTE_MS;
+  const episodes = [];
+  let streak = 0;
+  for (const action of actions) {
+    if (isRefuelDeposit(action)) { streak = 0; continue; }
+    if (!action.trade) continue;
+    streak = action.trade.outcome === 'loss' ? streak + 1 : 0;
+    if (streak === options.losingStreakLength) {
+      episodes.push(refuelEpisode(trades[action.trade.index], deposits, windowMs, observationEndMs));
+    }
+  }
+  return episodes;
+}
+
+// Signal 6: for each same-session run of 2+ realized losses, log(stake after loss m /
+// stake after loss 1) at step m - 1. Points from one run share `run` and `reference`.
+function observeEscalation(sessions) {
+  const points = [];
+  const excluded = { missingStake: 0, sessionEnded: 0 };
+  let runs = 0;
+
+  for (const session of sessions) {
+    const sessionTrades = session.trades;
+    let start = 0;
+    while (start < sessionTrades.length) {
+      if (sessionTrades[start].outcome !== 'loss') { start += 1; continue; }
+      let length = 1;
+      while (start + length < sessionTrades.length && sessionTrades[start + length].outcome === 'loss') length += 1;
+
+      if (length >= 2) {
+        const reference = sessionTrades[start + 1]; // the trade after the first loss
+        let used = 0;
+        for (let m = 2; m <= length; m += 1) {
+          const response = sessionTrades[start + m]; // the trade after the m-th loss
+          if (!response) excluded.sessionEnded += 1;
+          else if (reference.stake === null || response.stake === null) excluded.missingStake += 1;
+          else {
+            points.push({
+              run: runs,
+              step: m - 1,
+              reference: reference.index,
+              response: response.index,
+              logRatio: Math.log(response.stake / reference.stake)
+            });
+            used += 1;
+          }
+        }
+        if (used) runs += 1;
+      }
+      start += length;
+    }
+  }
+  return { points, runs, excluded };
+}
+
+function observedTrade(trade, previous, session, gapMs, observationEndMs) {
+  const { event } = trade.action;
+  const endsSession = session.trades.at(-1) === trade;
+  return {
+    index: trade.index,
+    action: trade.action.index,
+    session: trade.session,
+    t: trade.t,
+    stake: trade.stake,
+    result: trade.result,
+    outcome: trade.outcome,
+    first: !previous,
+    previousOutcome: previous ? previous.outcome : null,
+    lossRun: trade.lossRunInSession,
+    running: trade.running,
+    endsSession,
+    // The data ends before we can tell whether this session would have continued.
+    censored: endsSession && observationEndMs - session.endT < gapMs,
+    balanceBefore: isFiniteNumber(event.balance_before) ? event.balance_before : null,
+    balanceAfter: isFiniteNumber(event.balance_after) ? event.balance_after : null
+  };
+}
+
+function observeTrader(traderToken, group, options, observationEndMs) {
+  const rows = [...group.rows].sort(compareRows);
+  const { actions, sessions, trades } = structure(rows, options);
+  computeRunningResults(sessions);
+
+  const gapMs = options.sessionGapMinutes * MINUTE_MS;
+  const observedTrades = trades.map((trade, index) => observedTrade(trade, trades[index - 1], sessions[trade.session], gapMs, observationEndMs));
+  const deposits = actions
+    .filter((action) => action.type === 'deposit')
+    .map((action) => ({ action: action.index, session: action.session, t: action.t, amount: depositAmountOf(action.event), refuel: isRefuelDeposit(action) }));
+  const medianStake = median(trades.map((trade) => trade.stake).filter((stake) => stake !== null));
+
+  return {
+    version: BEHAVIOR_VERSION,
+    traderToken,
+    options,
+    observationEndMs,
+    inputs: {
+      tradeCount: trades.length,
+      tradesWithStake: trades.filter((trade) => trade.stake !== null).length,
+      tradesWithOutcome: trades.filter((trade) => trade.outcome !== null).length,
+      tradesMissingOutcome: trades.filter((trade) => trade.outcome === null).length,
+      tradesWithBalances: trades.filter((trade) => hasBalances(trade.action.event)).length,
+      depositCount: actions.filter((action) => action.type === 'deposit').length,
+      withdrawalCount: actions.filter((action) => action.type === 'withdrawal').length,
+      sessionCount: sessions.length,
+      medianStake,
+      skippedInvalidTimestamps: group.invalidTimestamps
+    },
+    sessions: sessions.map((session) => ({
+      index: session.index,
+      start: session.actions[0].t,
+      end: session.endT,
+      actionCount: session.actions.length,
+      tradeCount: session.trades.length,
+      source: session.source,
+      complete: session.complete,
+      maxDrawdown: session.maxDrawdown
+    })),
+    trades: observedTrades,
+    deposits,
+    postOutcomeStake: observePostOutcomeStake(trades, options),
+    reentryLatency: observeReentryLatency(trades),
+    escalation: observeEscalation(sessions),
+    refuel: { losingStreak: observeLosingStreaks(actions, observedTrades, deposits, options, observationEndMs) }
+  };
+}
+
+// Why the low-balance trigger can't be used, or null if every trade has both balance fields.
+function balanceAvailability(record) {
+  const { trades } = record;
+  if (!trades.length) return 'no trades';
+  const withBalances = trades.filter((trade) => trade.balanceBefore !== null && trade.balanceAfter !== null).length;
+  if (withBalances === 0) return 'balance_before and balance_after unavailable';
+  if (withBalances < trades.length) return `balance fields incomplete: ${withBalances} of ${trades.length} trades have both`;
+  return null;
+}
+
+/**
+ * Signal 5's low-balance trigger for one trader's observations, with the
+ * threshold (in currency) chosen by the caller. A trigger is a trade that takes
+ * the balance from at or above the threshold to below it. Each episode is
+ * { trade, t, censored, refueled }; refueled is null when censored.
+ *
+ * Returns { episodes, reason }. episodes is null, with a reason, unless every
+ * trade has both balance fields. Signal 5 calls this with its median-stake
+ * threshold; the twin estimator calls it with its estimated baseStake.
+ */
+export function lowBalanceRefuelEpisodes(record, threshold) {
+  const reason = balanceAvailability(record);
+  if (reason !== null) return { episodes: null, reason };
+  if (!isFiniteNumber(threshold)) throw new RangeError('lowBalanceRefuelEpisodes: threshold must be a finite number');
+  const windowMs = record.options.refuelWindowMinutes * MINUTE_MS;
+  const episodes = record.trades
+    .filter((trade) => trade.balanceBefore >= threshold && trade.balanceAfter < threshold)
+    .map((trade) => refuelEpisode(trade, record.deposits, windowMs, record.observationEndMs));
+  return { episodes, reason: null };
+}
+
+// --- Signal 1: post-outcome stake response ----------------------------------
+
+function postOutcomeStakeSignal(record, context) {
+  const minimum = minimumFor('postOutcomeStake', context.options);
+  const { loss, win, excluded } = record.postOutcomeStake;
+
+  const summarize = (episodes, side) => {
+    const values = episodes.map((episode) => episode.ratio);
+    return gated(
+      values.length,
+      minimum,
+      context.hasOutcomes ? `no realized ${side} followed by a trade with a usable stake and stake history` : 'realized_result unavailable for every trade',
+      () => ({ value: median(values), meanLogRatio: mean(values.map(Math.log)) }),
+      { meanLogRatio: null }
+    );
+  };
+  const afterLoss = summarize(loss, 'loss');
+  const afterWin = summarize(win, 'win');
+  const lossMinusWin = difference(afterLoss, afterWin);
+
+  return {
+    afterLoss,
+    afterWin,
+    lossMinusWin: {
+      value: lossMinusWin.value,
+      logRatioDifference: lossMinusWin.value === null ? null : afterLoss.meanLogRatio - afterWin.meanLogRatio,
+      n: lossMinusWin.n,
+      reason: lossMinusWin.reason
+    },
+    excluded: { ...excluded }
+  };
+}
+
+// --- Signal 2: re-entry latency ---------------------------------------------
+
+function reentryLatencySignal(record, context) {
+  const minimum = minimumFor('reentryLatency', context.options);
+  const { anySession, withinSession, excluded } = record.reentryLatency;
 
   const build = (lists, scope) => {
     const summarize = (values, side) => gated(
@@ -397,15 +613,15 @@ function reentryLatencySignal(trades, context) {
   return {
     anySession: build(anySession, ''),
     withinSession: build(withinSession, ' in the same session'),
-    excluded
+    excluded: { ...excluded }
   };
 }
 
 // --- Signal 3: session drawdown ---------------------------------------------
 
-function sessionDrawdownSignal(sessions, context) {
+function sessionDrawdownSignal(record, context) {
   const minimum = minimumFor('sessionDrawdown', context.options);
-  const trading = sessions.filter((session) => session.trades.length);
+  const trading = record.sessions.filter((session) => session.tradeCount);
   const complete = trading.filter((session) => session.complete);
   const drawdowns = complete.map((session) => session.maxDrawdown);
   const emptyReason = trading.length
@@ -433,24 +649,19 @@ function sessionDrawdownSignal(sessions, context) {
 
 // --- Signal 4: session stop behavior ----------------------------------------
 
-function stopBehaviorSignal(sessions, context) {
-  const { options, medianStake, observationEndMs } = context;
+function stopBehaviorSignal(record, context) {
+  const { options, medianStake } = context;
   const minimum = minimumFor('stopBehavior', options);
-  const gapMs = options.sessionGapMinutes * MINUTE_MS;
   const tallies = Object.fromEntries(DRAWDOWN_BUCKETS.map((bucket) => [bucket, { n: 0, stops: 0 }]));
   const excluded = { unknownState: 0, censored: 0 };
 
   if (medianStake !== null) {
-    for (const session of sessions) {
-      session.trades.forEach((trade, position) => {
-        const last = position === session.trades.length - 1;
-        if (trade.running === null) { excluded.unknownState += 1; return; }
-        // The data ends before we can tell whether this session would have continued.
-        if (last && observationEndMs - session.endT < gapMs) { excluded.censored += 1; return; }
-        const tally = tallies[drawdownBucket(trade.running, medianStake, options)];
-        tally.n += 1;
-        if (last) tally.stops += 1;
-      });
+    for (const trade of record.trades) {
+      if (trade.running === null) { excluded.unknownState += 1; continue; }
+      if (trade.censored) { excluded.censored += 1; continue; }
+      const tally = tallies[drawdownBucket(trade.running, medianStake, options)];
+      tally.n += 1;
+      if (trade.endsSession) tally.stops += 1;
     }
   }
 
@@ -473,26 +684,18 @@ function stopBehaviorSignal(sessions, context) {
 
 // --- Signal 5: refuel behavior ----------------------------------------------
 
-function isRefuelDeposit(action) {
-  // A deposit recorded with an observed zero amount moved no money, so it is not a refuel.
-  return action.type === 'deposit' && !(isFiniteNumber(action.event.deposit_amount) && action.event.deposit_amount <= 0);
-}
-
-function refuelSignal(actions, trades, context) {
-  const { options, medianStake, observationEndMs } = context;
+function refuelSignal(record, context) {
+  const { options, medianStake } = context;
   const minimum = minimumFor('refuel', options);
-  const windowMs = options.refuelWindowMinutes * MINUTE_MS;
-  const deposits = actions.filter(isRefuelDeposit);
 
-  const measure = (triggers, emptyReason) => {
+  const summarize = (episodes, emptyReason) => {
     let n = 0;
     let refueled = 0;
     let censored = 0;
-    for (const trigger of triggers) {
-      // The full window must be observed, or a missing deposit could just be past the data's end.
-      if (observationEndMs - trigger.t < windowMs) { censored += 1; continue; }
+    for (const episode of episodes) {
+      if (episode.censored) { censored += 1; continue; }
       n += 1;
-      if (deposits.some((deposit) => deposit.index > trigger.index && deposit.t - trigger.t <= windowMs)) refueled += 1;
+      if (episode.refueled) refueled += 1;
     }
     const reason = n === 0 && censored > 0
       ? `all ${censored} triggers fall within ${options.refuelWindowMinutes} minutes of the observation end`
@@ -500,43 +703,25 @@ function refuelSignal(actions, trades, context) {
     return { ...gated(n, minimum, reason, () => ({ value: refueled / n })), refueled, censored };
   };
 
-  // Low-balance trigger: a trade that takes the balance from at or above the threshold to below it.
-  const tradesWithBalances = trades.filter((trade) => hasBalances(trade.action.event)).length;
-  const balanceComplete = trades.length > 0 && tradesWithBalances === trades.length;
+  const balanceGap = balanceAvailability(record);
   const threshold = options.lowBalanceThreshold ?? (medianStake === null ? null : options.lowBalanceStakeMultiple * medianStake);
   let lowBalance;
-  if (!balanceComplete || threshold === null) {
-    let reason = 'no positive stake_amount to set the low-balance threshold';
-    if (!trades.length) reason = 'no trades';
-    else if (tradesWithBalances === 0) reason = 'balance_before and balance_after unavailable';
-    else if (!balanceComplete) reason = `balance fields incomplete: ${tradesWithBalances} of ${trades.length} trades have both`;
+  if (balanceGap !== null || threshold === null) {
+    const reason = balanceGap ?? 'no positive stake_amount to set the low-balance threshold';
     lowBalance = { value: null, n: 0, reason, refueled: 0, censored: 0 };
   } else {
-    const triggers = trades
-      .filter((trade) => trade.action.event.balance_before >= threshold && trade.action.event.balance_after < threshold)
-      .map((trade) => trade.action);
-    lowBalance = measure(triggers, `balance never dropped below ${threshold}`);
+    lowBalance = summarize(lowBalanceRefuelEpisodes(record, threshold).episodes, `balance never dropped below ${threshold}`);
   }
 
-  // Losing-streak trigger: the trade that completes K consecutive realized losses.
-  // A deposit, win, push, or missing outcome resets the count.
   const streakLength = options.losingStreakLength;
-  const streakTriggers = [];
-  let streak = 0;
-  for (const action of actions) {
-    if (isRefuelDeposit(action)) { streak = 0; continue; }
-    if (!action.trade) continue;
-    streak = action.trade.outcome === 'loss' ? streak + 1 : 0;
-    if (streak === streakLength) streakTriggers.push(action);
-  }
-  const losingStreak = measure(
-    streakTriggers,
+  const losingStreak = summarize(
+    record.refuel.losingStreak,
     context.hasOutcomes ? `no run of ${streakLength} consecutive realized losses` : 'realized_result unavailable for every trade'
   );
 
   return {
     windowMinutes: options.refuelWindowMinutes,
-    primary: balanceComplete ? 'lowBalance' : 'losingStreak',
+    primary: balanceGap === null ? 'lowBalance' : 'losingStreak',
     lowBalance: { ...lowBalance, threshold },
     losingStreak: { ...losingStreak, streakLength }
   };
@@ -544,98 +729,44 @@ function refuelSignal(actions, trades, context) {
 
 // --- Signal 6: escalation within session ------------------------------------
 
-function escalationSignal(sessions, context) {
+function escalationSignal(record, context) {
   const minimum = minimumFor('escalation', context.options);
-  const points = []; // [m - 1, log(stake after loss m / stake after loss 1)]
-  const excluded = { missingStake: 0, sessionEnded: 0 };
-  let runs = 0;
-
-  for (const session of sessions) {
-    const sessionTrades = session.trades;
-    let start = 0;
-    while (start < sessionTrades.length) {
-      if (sessionTrades[start].outcome !== 'loss') { start += 1; continue; }
-      let length = 1;
-      while (start + length < sessionTrades.length && sessionTrades[start + length].outcome === 'loss') length += 1;
-
-      if (length >= 2) {
-        const base = sessionTrades[start + 1].stake; // stake on the trade after the first loss
-        let used = 0;
-        for (let m = 2; m <= length; m += 1) {
-          const response = sessionTrades[start + m]; // the trade after the m-th loss
-          if (!response) excluded.sessionEnded += 1;
-          else if (base === null || response.stake === null) excluded.missingStake += 1;
-          else {
-            points.push([m - 1, Math.log(response.stake / base)]);
-            used += 1;
-          }
-        }
-        if (used) runs += 1;
-      }
-      start += length;
-    }
-  }
+  const { points, runs, excluded } = record.escalation;
 
   const emptyReason = context.hasOutcomes
     ? 'no usable stake after the second or later loss of a same-session losing run'
     : 'realized_result unavailable for every trade';
   // Least-squares slope through the origin: at m = 1 the ratio is 1 by construction.
   const summary = gated(points.length, minimum, emptyReason, () => {
-    const sxy = points.reduce((total, [x, y]) => total + x * y, 0);
-    const sxx = points.reduce((total, [x]) => total + x * x, 0);
+    const sxy = points.reduce((total, point) => total + point.step * point.logRatio, 0);
+    const sxx = points.reduce((total, point) => total + point.step * point.step, 0);
     const logSlope = sxy / sxx;
     return { value: Math.exp(logSlope), logSlope };
   }, { logSlope: null });
 
-  return { ...summary, runs, excluded };
+  return { ...summary, runs, excluded: { ...excluded } };
 }
 
-// --- Entry point ------------------------------------------------------------
+// --- Entry points -----------------------------------------------------------
 
-function analyzeTrader(traderToken, group, options, observationEndMs) {
-  const rows = [...group.rows].sort(compareRows);
-  const { actions, sessions, trades } = structure(rows, options);
-  computeRunningResults(sessions);
-
-  const medianStake = median(trades.map((trade) => trade.stake).filter((stake) => stake !== null));
-  const context = {
-    options,
-    observationEndMs,
-    medianStake,
-    hasOutcomes: trades.some((trade) => trade.outcome !== null)
-  };
-
+function summarizeTrader(record) {
+  const { options, inputs } = record;
+  const context = { options, medianStake: inputs.medianStake, hasOutcomes: inputs.tradesWithOutcome > 0 };
   return {
-    version: BEHAVIOR_VERSION,
-    traderToken,
+    version: record.version,
+    traderToken: record.traderToken,
     options,
-    inputs: {
-      tradeCount: trades.length,
-      tradesWithStake: trades.filter((trade) => trade.stake !== null).length,
-      tradesWithOutcome: trades.filter((trade) => trade.outcome !== null).length,
-      tradesMissingOutcome: trades.filter((trade) => trade.outcome === null).length,
-      tradesWithBalances: trades.filter((trade) => hasBalances(trade.action.event)).length,
-      depositCount: actions.filter((action) => action.type === 'deposit').length,
-      withdrawalCount: actions.filter((action) => action.type === 'withdrawal').length,
-      sessionCount: sessions.length,
-      medianStake,
-      skippedInvalidTimestamps: group.invalidTimestamps
-    },
-    postOutcomeStake: postOutcomeStakeSignal(trades, context),
-    reentryLatency: reentryLatencySignal(trades, context),
-    sessionDrawdown: sessionDrawdownSignal(sessions, context),
-    stopBehavior: stopBehaviorSignal(sessions, context),
-    refuel: refuelSignal(actions, trades, context),
-    escalation: escalationSignal(sessions, context)
+    inputs: { ...inputs },
+    postOutcomeStake: postOutcomeStakeSignal(record, context),
+    reentryLatency: reentryLatencySignal(record, context),
+    sessionDrawdown: sessionDrawdownSignal(record, context),
+    stopBehavior: stopBehaviorSignal(record, context),
+    refuel: refuelSignal(record, context),
+    escalation: escalationSignal(record, context)
   };
 }
 
-/**
- * Computes behavior-0.2.0 signals for every trader in `events`.
- * Returns one record per trader, sorted by trader token. Throws RangeError on
- * invalid options. The input events are not modified.
- */
-export function buildBehaviorSignals(events, options = {}) {
+function observeAll(events, options, caller) {
   const groups = new Map();
   let latestEventMs = null;
 
@@ -653,8 +784,54 @@ export function buildBehaviorSignals(events, options = {}) {
     if (latestEventMs === null || t > latestEventMs) latestEventMs = t;
   }
 
-  const { resolved, observationEndMs } = resolveOptions(options, latestEventMs);
+  const { resolved, observationEndMs } = resolveOptions(options, latestEventMs, caller);
   return [...groups.entries()]
     .sort(([a], [b]) => compareText(a, b))
-    .map(([token, group]) => analyzeTrader(token, group, resolved, observationEndMs));
+    .map(([token, group]) => observeTrader(token, group, resolved, observationEndMs));
+}
+
+/**
+ * Returns each trader's behavior-0.2.0 observations: the per-trade,
+ * per-deposit, and per-episode values the signals summarize. One record per
+ * trader, sorted by trader token. Takes the same options as
+ * buildBehaviorSignals and throws RangeError on invalid ones. Times are epoch
+ * milliseconds. The input events are not modified.
+ *
+ * Each record has version, traderToken, the resolved options,
+ * observationEndMs, the same `inputs` counts as the signals, and:
+ * - sessions: { index, start, end, actionCount, tradeCount, source, complete, maxDrawdown }
+ * - trades: { index, action, session, t, stake, result, outcome, first,
+ *   previousOutcome, lossRun, running, endsSession, censored, balanceBefore,
+ *   balanceAfter }. outcome is null when realized_result is missing.
+ *   previousOutcome is the outcome of the trader's previous trade in any
+ *   session (null when it is missing or `first` is true). lossRun is the
+ *   same-session run of realized losses ending at this trade. running is the
+ *   running session result after it (null when unknown). censored marks a
+ *   session-ending trade within sessionGapMinutes of the observation end.
+ * - deposits: { action, session, t, amount, refuel }. refuel is false for a
+ *   deposit with an observed amount of 0 or less.
+ * - postOutcomeStake: { loss, win, excluded }, signal-1 episodes
+ *   { trigger, response, ratio, logRatio } by the trigger's outcome.
+ * - reentryLatency: { anySession, withinSession, excluded }, minutes by the
+ *   trigger's outcome ({ loss: [], win: [] }).
+ * - escalation: { points, runs, excluded }, signal-6 points
+ *   { run, step, reference, response, logRatio }. Points from one losing run
+ *   share `run` and the same reference stake.
+ * - refuel: { losingStreak }, signal-5 losing-streak episodes. Low-balance
+ *   episodes depend on a threshold: use lowBalanceRefuelEpisodes.
+ * Trade, reference, and response fields are indexes into `trades`; action
+ * fields order trades and deposits in event order.
+ */
+export function buildBehaviorObservations(events, options = {}) {
+  return observeAll(events, options, 'buildBehaviorObservations');
+}
+
+/**
+ * Computes behavior-0.2.0 signals for every trader in `events` by summarizing
+ * the observations from buildBehaviorObservations. Returns one record per
+ * trader, sorted by trader token. Throws RangeError on invalid options. The
+ * input events are not modified.
+ */
+export function buildBehaviorSignals(events, options = {}) {
+  return observeAll(events, options, 'buildBehaviorSignals').map(summarizeTrader);
 }

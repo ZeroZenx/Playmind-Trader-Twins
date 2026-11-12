@@ -30,7 +30,7 @@ await writeBehavioralDataset(dataset, 'analysis/output/synthetic');
 | `tradersPerArchetype` | 1 | Archetype mode: copies of each archetype. Each copy has its own random stream. |
 | `traderCount` | 100 | Population mode: number of traders. |
 | `traders` | `[]` | Custom mode: `{ archetype?, parameters? }` per trader. Parameters override the archetype's, and `stopHazard` merges per bucket. With no archetype, the base is steady and the truth records `custom`. |
-| `sessionsPerTrader` | 100 | A positive integer, or `{ min, max }` for a uniform integer draw per trader. Raise it when a test needs more loss episodes per trader. |
+| `sessionsPerTrader` | 100 | A positive integer, or `{ min, max }` for a uniform integer draw per trader. Add `scale: 'log'` for a log-uniform draw, `floor(exp(U(log min, log(max + 1))))`, so short histories are common: with `{ min: 2, max: 150, scale: 'log' }` about 4 in 10 traders have 10 or fewer sessions. `scale: 'uniform'` is the default and gives exactly the same output as leaving it out. Raise the counts when a test needs more loss episodes per trader. |
 | `includeBalances` | true | `false` leaves `balance_before` and `balance_after` out of every event. Balances are still simulated. |
 | `missingOutcomeShare` | 0 | Share of trades whose `realized_result` is set to null. Balances are kept. |
 | `startDate` | `2026-03-02T00:00:00.000Z` | Earliest possible first session. |
@@ -168,11 +168,11 @@ About 40% of drawn chase coefficients are above 1 and 60% below, so the populati
 
 ## Reading the signals against the truth
 
-The signals don't equal the parameters. The tests check direction only, and the twin-0.2.0 estimator (Prompt 3) handles recovery. ADR-010 lists the choices the estimator has to account for.
+The signals don't equal the parameters. The generator tests check direction only. Recovery belongs to the twin-0.2.0 estimator (`src/engine/estimate.mjs`, ADR-011): `test/twin-recovery.test.mjs` and `npm run twin:recovery` fit a 500-trader population with `sessionsPerTrader: { min: 2, max: 150, scale: 'log' }` and compare estimates and intervals with the truth. ADR-010 lists the generator choices the estimator has to account for.
 
 - `chaseCoefficient` vs signal 1. Signal 1 divides each stake by the median of the previous 20 stakes, and that median includes chase-inflated stakes. `afterLoss.value` and `lossMinusWin.value` are therefore not the coefficient. `lossMinusWin.logRatioDifference` is the closer match, because the rolling median roughly cancels in the difference.
 - `escalationPerLoss` vs signal 6. Signal 6 compares each stake with the stake after the first loss of the run, which cancels the base stake and the chase term. Forced stops cut long, expensive losing runs short.
 - Latencies vs signal 2. Compare with `reentryLatency.withinSession`. `anySession` includes the idle time between sessions. Signal 2 skips pushes, while the generator uses the after-win latency after a push.
-- `stopHazard` vs signal 4. The generator's bucket edges use `baseStake`, but the signal's use the observed median stake: higher than `baseStake` for chasers, lower for shrinkers. Observed stop rates also include forced stops. `realized.tradesByBucket` and `realized.stops` give the generator-side counts.
+- `stopHazard` vs signal 4. The generator's bucket edges use `baseStake`, but the signal's use the observed median stake: higher than `baseStake` for chasers, lower for shrinkers. Observed stop rates also include forced stops. `realized.tradesByBucket` and `realized.stops` give the generator-side counts. Hazard plus forced stops per trade comes from the same trades the estimator sees, so it is a descriptive check, not a parameter to measure coverage against. twin-0.2.0 estimates the voluntary hazard and is compared with `stopHazard`.
 - `refuelProbability` vs signal 5. Refuel deposits always land inside the window, and session-start deposits never do. A trader with `refuelProbability` 0 therefore has an observed refuel rate of exactly 0. The generator's trigger uses `baseStake`, and the signal's uses the observed median stake.
 - `depositAmount`. Session-start and refuel deposits are drawn the same way, except for raised session-start deposits.

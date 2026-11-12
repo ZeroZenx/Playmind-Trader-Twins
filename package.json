@@ -9,9 +9,10 @@
     "build": "next build",
     "start": "next start",
     "demo": "node demo/run.mjs",
+    "twin:recovery": "node scripts/twin-recovery.mjs",
     "test": "node --test",
     "verify:release": "node scripts/verify-release.mjs",
-    "check": "node --check scripts/verify-release.mjs && node --check demo/run.mjs && node --check src/engine/index.mjs && node --check src/engine/rng.mjs && node --check src/engine/validate.mjs && node --check src/engine/signals.mjs && node --check src/engine/behavior.mjs && node --check src/engine/twin.mjs && node --check src/engine/policy.mjs && node --check src/engine/report.mjs && node --check src/synthetic/generate.mjs && node --check src/synthetic/behavioral-generate.mjs && node --check src/synthetic/behavioral-write.mjs"
+    "check": "node --check scripts/verify-release.mjs && node --check demo/run.mjs && node --check src/engine/index.mjs && node --check src/engine/rng.mjs && node --check src/engine/validate.mjs && node --check src/engine/signals.mjs && node --check src/engine/behavior.mjs && node --check src/engine/stats.mjs && node --check src/engine/estimate.mjs && node --check src/engine/twin.mjs && node --check src/engine/policy.mjs && node --check src/engine/report.mjs && node --check src/synthetic/generate.mjs && node --check src/synthetic/behavioral-generate.mjs && node --check src/synthetic/behavioral-write.mjs && node --check src/synthetic/twin-recovery.mjs && node --check scripts/twin-recovery.mjs"
   },
   "engines": {
     "node": ">=20"
