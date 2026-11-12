@@ -26,9 +26,9 @@ Updated 2026-11-11.
 
 ## Holdout result
 
-The transparent logistic model trained on 2024-2025 episodes reached holdout AUROC 0.821 and average precision 0.366. The prior-chase-rate baseline reached AUROC 0.796 and average precision 0.316. The holdout prevalence was 7.69%.
+The holdout evaluation of the transparent logistic model against the prior-chase-rate baseline exists; its results are kept in local output (`analysis/output/`, gitignored).
 
-These metrics support a predictive signal for the defined public-data proxy. They do not support a claim about realized loss chasing across all traders or customers.
+The evaluation concerns a public-data proxy (OBSERVATIONAL). It does not support a claim about realized loss chasing across all traders or customers.
 
 Sources:
 

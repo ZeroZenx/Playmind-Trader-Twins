@@ -65,6 +65,6 @@ Run the frozen model test:
 POLARS_MAX_THREADS=4 ./.venv/bin/python analysis/polymarket_holdout_model.py
 ```
 
-The model trains on 2024-2025 loss episodes and evaluates Jan 1 through Mar 29, 2026. It uses a frozen 2024-2025 wallet baseline and a transparent logistic model. The first holdout run produced AUROC 0.821 and average precision 0.366 against 0.796 and 0.316 for the prior-chase-rate baseline. These metrics support a public-data behavioral proxy, not a causal or clinical claim.
+The model trains on 2024-2025 loss episodes and evaluates Jan 1 through Mar 29, 2026. It uses a frozen 2024-2025 wallet baseline and a transparent logistic model. The holdout evaluation exists and its results are kept in local output (`analysis/output/`, gitignored). It concerns a public-data behavioral proxy, not a causal or clinical claim.
 
 The download script targets [vgregoire/polymarket-users](https://huggingface.co/datasets/vgregoire/polymarket-users) only. It does not target the separate raw-trades dataset.

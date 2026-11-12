@@ -8,3 +8,17 @@ analysis/cache/
 __pycache__/
 *.pyc
 .DS_Store
+
+# Customer data boundary: never commit customer data, raw or derived.
+data/
+*.parquet
+
+# CSV files are ignored everywhere except synthetic fixtures and demo output.
+*.csv
+!test/fixtures/**/*.csv
+!demo/**/*.csv
+
+# Environment files: only the example is tracked.
+.env
+.env.*
+!.env.example

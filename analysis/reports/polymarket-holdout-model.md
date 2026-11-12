@@ -8,10 +8,8 @@ This evaluation trains on 2024-01-01 through 2025-12-31 and scores 2026-01-01 th
 - Training episodes: 11,628,536, sampled for fitting: 500,000
 - Holdout loss episodes: 2,096,291
 - Holdout positive rate: 7.69%
-- Logistic model AUROC: 0.821
-- Logistic model average precision: 0.366
-- Prior-chase-rate baseline AUROC: 0.796
-- Prior-chase-rate baseline average precision: 0.316
+
+The holdout evaluation of the logistic model and the prior-chase-rate baseline exists; its results are kept in local output (`analysis/output/polymarket-holdout-model-summary.json`, gitignored).
 
 The baseline provides a persistence check. The model only earns a predictive claim if its holdout metrics improve on the prior-chase-rate baseline and beat the holdout prevalence by a meaningful margin.
 

@@ -7,6 +7,7 @@ import {
   buildTwins,
   comparePolicy,
   sanitizeCsvCell,
+  simulateTwin,
   validateEvents
 } from '../src/engine/index.mjs';
 
@@ -72,6 +73,33 @@ test('policy comparison produces separate baseline and policy results', () => {
   assert.ok(run.aggregate.policyTriggers > 0);
   assert.ok(run.aggregate.policyTradeCount <= run.aggregate.baselineTradeCount);
   assert.equal(run.aggregate.policyTotalDeposits, run.aggregate.baselineTotalDeposits);
+});
+
+test('stake limit caps trades at maxStake instead of dropping them', () => {
+  // Every proposed stake is 100 * (0.55..1.45), so every trade exceeds maxStake = 20.
+  const twin = {
+    twinId: 'twin_cap',
+    randomSeed: 11,
+    profile: {
+      traderToken: 'cap',
+      sessionRatePerDay: 2,
+      tradesPerSession: 4,
+      averageStake: 100,
+      averageDeposit: 50,
+      lossRate: 0.5,
+      marketMix: {}
+    }
+  };
+  const baseline = simulateTwin(twin, { horizonDays: 3, seed: 11 });
+  const capped = simulateTwin(twin, { horizonDays: 3, seed: 11, policy: { type: 'stake_limit', maxStake: 20 } });
+  const cappedTrades = capped.events.filter((event) => event.type === 'trade');
+
+  assert.ok(baseline.tradeCount > 0);
+  assert.equal(capped.tradeCount, baseline.tradeCount);
+  assert.equal(capped.blockedTrades, 0);
+  assert.equal(capped.policyTriggers, capped.tradeCount);
+  assert.ok(cappedTrades.every((event) => event.stakeAmount === 20));
+  assert.equal(capped.totalStake, 20 * capped.tradeCount);
 });
 
 test('CSV formula values receive a neutralizing prefix', () => {

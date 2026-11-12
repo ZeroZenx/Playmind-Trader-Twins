@@ -55,7 +55,7 @@ function chooseMarket(marketMix, rng) {
 
 function policyBlocksTrade(policy, state, proposedStake, eventTime) {
   if (!policy) return null;
-  if (policy.type === 'stake_limit' && proposedStake > policy.maxStake) return 'stake_limit';
+  // stake_limit never blocks: it caps the stake at maxStake below.
   if (policy.type === 'cooldown' && state.cooldownUntil && eventTime < state.cooldownUntil) return 'cooldown';
   return null;
 }
@@ -117,6 +117,7 @@ export function simulateTwin(twin, options = {}) {
       }
 
       const stake = policy?.type === 'stake_limit' ? Math.min(proposedStake, policy.maxStake) : proposedStake;
+      if (stake < proposedStake) policyTriggers += 1;
       const adjustedResult = stake === proposedStake
         ? realizedResult
         : roundMoney(realizedResult * (stake / proposedStake));
