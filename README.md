@@ -60,6 +60,16 @@ npm run twin:simulation
 
 Simulates a SYNTHETIC population with `simulateTwinV2` (`docs/MODEL_CARD.md`, ADR-012), on the generator's true parameters and on fitted twins, and checks how often each trader's training behavior falls inside its simulated band. The full results go to `analysis/output/twin-simulation/`, which is gitignored. Calibration numbers stay in that local output.
 
+## Sweep policies and response assumptions
+
+```bash
+npm run policy:sweep
+# A quick, smaller run:
+npm run policy:sweep -- --traders 100 --replicates 50 --policies cooldown
+```
+
+Runs cooldowns, deposit limits, stake limits, and session loss limits on fitted twins of a SYNTHETIC population (`docs/MODEL_CARD.md`, ADR-013). Each policy is compared with no policy on common random numbers, across its settings and across named assumptions about how traders respond. With no intervention data, every response is an assumption, and the output says which assumption drives each result. These are simulations under stated assumptions, not causal claims. The full run takes a while and prints its runtime. Results go to `analysis/output/policy-sweep/`, which is gitignored. Policy result numbers stay in that local output.
+
 ## Run the web application
 
 Set `DATABASE_URL`, `NEON_AUTH_BASE_URL`, and `NEON_AUTH_COOKIE_SECRET` in the local environment, then run:

@@ -34,9 +34,11 @@
  *
  * Common random numbers: each kind of decision draws from its own stream (STREAMS), and
  * each stream is used a fixed number of times per event of its kind. A policy that
- * changes one decision never shifts another decision's draws. Prompt 5 compares policy
- * and no-policy runs this way, through the single hook `intervention`
- * (INTERVENTION_POINTS). This module always uses NO_INTERVENTION and implements no policy.
+ * changes one decision never shifts another decision's draws. The policy layer
+ * (policy-sim.mjs, ADR-013) compares policy and no-policy runs this way, through the
+ * single hook `intervention` (INTERVENTION_POINTS, contract below). simulateTwinV2 always
+ * uses NO_INTERVENTION and implements no policy; a run with NO_INTERVENTION never calls
+ * the hook, so no-policy runs are exactly simulator-0.2.0's.
  *
  * Pure and deterministic: the same fit and options give the same result.
  */
@@ -111,20 +113,50 @@ export const METRIC_SETTINGS = deepFreeze({
 });
 
 // One random stream per kind of decision. 'parameters' has a sub-stream per parameter.
-export const STREAMS = Object.freeze(['parameters', 'outcomes', 'stakeNoise', 'latency', 'stops', 'refuel', 'deposits', 'idle']);
+// 'policy' is drawn only by an intervention (runInfo.policyStream), never by the simulator.
+// Every stream is seeded by name, so adding one moves no other.
+export const STREAMS = Object.freeze(['parameters', 'outcomes', 'stakeNoise', 'latency', 'stops', 'refuel', 'deposits', 'idle', 'policy']);
 
 /**
- * The one hook Prompt 5's policies will use. The simulator calls
- * intervention(point, proposal, state) and uses the returned proposal:
+ * The one hook policies use (ADR-012 point 11, extended in ADR-013). The simulator calls
+ * intervention(point, proposal, state) and uses the returned object. INTERVENTION_POINTS
+ * keeps simulator-0.2.0's three points; ADR-013 added SESSION_START_POINT. Each point's
+ * return is checked, and a policy can only restrict or delay what the trader proposes,
+ * except where noted:
+ * - 'sessionStart', { seconds, earliestSeconds, lastEventSeconds }: a session is about to
+ *   start at `seconds` (after the idle draws). Return { seconds, depositCents? }. The start
+ *   may move later (a cooldown, leaving for the day) or earlier (a quick return), never
+ *   before earliestSeconds (more than sessionGapMinutes after the last event, so the event
+ *   data sees a new session). depositCents > 0 lands a deferred deposit at the start,
+ *   before the session-start deposit rule; it passes through 'beforeDeposit'.
  * - 'beforeStake', { stakeCents }: the stake about to be placed, before the broke rule.
- * - 'beforeDeposit', { kind, amountCents }: a deposit about to be made ('sessionStart' or 'refuel').
- * - 'afterTrade', { endSession: false }: after a trade settles, before the stop draw.
+ *   Return { stakeCents } (a positive integer) or { skip: true }. A skipped attempt places
+ *   nothing but uses the attempt's outcome, stop, and latency draws (below).
+ * - 'beforeDeposit', { kind, amountCents, seconds }: a deposit about to be made at
+ *   `seconds` ('sessionStart', 'refuel', or 'deferred'). Return { amountCents } between 0
+ *   and the proposed amount. 0 makes no deposit.
+ * - 'afterTrade', { endSession }: after a trade settles and after the trader's own stop
+ *   decision (endSession: true when the stop hazard or the session cap ends the session).
+ *   Return { endSession, resumeAtSeconds?, reset? }. A policy can't overrule the trader's
+ *   own stop: when the proposal's endSession is true the session ends whatever is
+ *   returned. Otherwise endSession: true ends it (counted as an intervention stop), and
+ *   resumeAtSeconds pauses it: the next attempt comes no earlier than that time. reset:
+ *   true (with a pause) starts the return as a new session: running result, losing run,
+ *   bucket, and drawdown start over, with no idle draw and no session-start deposit.
  * state is a snapshot: { traderToken, replicate, seconds, session, tradesInSession,
  * balanceCents, runningCents, lossRun, lastOutcome, bucket }. An intervention must not
- * draw from the run's streams. NO_INTERVENTION returns every proposal unchanged, and the
- * simulator skips the call entirely when it is the hook in use.
+ * draw from the run's streams except runInfo.policyStream. NO_INTERVENTION returns every
+ * proposal unchanged, and the simulator skips the call entirely when it is the hook in use.
+ *
+ * Draws per trade attempt, so later attempts stay aligned with the baseline: an attempt
+ * that reaches the outcome (placed, capped, or skipped) uses 4 outcome, 1 stop, and 2
+ * latency draws, and its next stake 2 stake-noise draws; an attempt the broke rule ends
+ * uses none of them, as in simulator-0.2.0. A skipped attempt's stop draw is the trader's
+ * own decision at the unchanged bucket, and its latency is the one for the last outcome.
+ * The session cap counts attempts, which equals trades in a run without skips.
  */
 export const INTERVENTION_POINTS = Object.freeze(['beforeStake', 'beforeDeposit', 'afterTrade']);
+export const SESSION_START_POINT = 'sessionStart';
 export const NO_INTERVENTION = Object.freeze(function noIntervention(point, proposal) {
   return proposal;
 });
@@ -555,12 +587,51 @@ function toIso(seconds) {
   return new Date(seconds * 1000).toISOString();
 }
 
+// --- Hook return checks (a policy bug fails loudly instead of corrupting a run) ------------
+
+function hookError(point, message) {
+  return new TypeError(`simulateTwinV2: intervention at '${point}' ${message}`);
+}
+
+function checkSessionStart(decision) {
+  if (!isPlainObject(decision) || !Number.isInteger(decision.seconds)) throw hookError(SESSION_START_POINT, 'must return { seconds } with integer seconds');
+  const deposit = decision.depositCents ?? 0;
+  if (!Number.isInteger(deposit) || deposit < 0) throw hookError(SESSION_START_POINT, 'returned a depositCents that is not a non-negative integer');
+  return { seconds: decision.seconds, depositCents: deposit };
+}
+
+function checkStake(decision) {
+  if (isPlainObject(decision) && decision.skip === true) return { skip: true };
+  if (!isPlainObject(decision) || !Number.isInteger(decision.stakeCents) || decision.stakeCents < 1) {
+    throw hookError('beforeStake', 'must return { stakeCents } (a positive integer) or { skip: true }');
+  }
+  return { skip: false, stakeCents: decision.stakeCents };
+}
+
+function checkDeposit(decision, proposed) {
+  const amount = isPlainObject(decision) ? decision.amountCents : undefined;
+  if (!Number.isInteger(amount) || amount < 0 || amount > proposed) {
+    throw hookError('beforeDeposit', `must return { amountCents } between 0 and the proposed ${proposed}`);
+  }
+  return amount;
+}
+
+function checkAfterTrade(decision) {
+  if (!isPlainObject(decision) || typeof decision.endSession !== 'boolean') throw hookError('afterTrade', 'must return { endSession } with a boolean');
+  const resume = decision.resumeAtSeconds ?? null;
+  if (resume !== null && !Number.isInteger(resume)) throw hookError('afterTrade', 'returned a resumeAtSeconds that is not an integer');
+  if (decision.reset !== undefined && typeof decision.reset !== 'boolean') throw hookError('afterTrade', 'returned a reset that is not a boolean');
+  if (decision.reset && resume === null) throw hookError('afterTrade', 'returned reset without resumeAtSeconds');
+  return { endSession: decision.endSession, resumeAtSeconds: resume, reset: decision.reset === true };
+}
+
 /**
  * Simulates one run. p holds the run's parameters (runParameters). Money is in integer
  * cents. Draws per event, each from its own stream: outcomes 4 per trade (outcome, payout
  * normal, loss ratio), stops 1 per trade, latency 2 per trade (drawn even when the session
  * ends), stake noise 2 per intended stake, refuel 2 per trigger (decision, timing), deposits
- * 2 per intended deposit, idle 2 per session (start time, first-trade delay).
+ * 2 per intended deposit, idle 2 per session (start time, first-trade delay). With a hook,
+ * "per trade" means per attempt that reaches the outcome (INTERVENTION_POINTS above).
  */
 function simulateRun(plan, p, streams, context, replicate, intervention = NO_INTERVENTION) {
   const { behavior, settings } = context;
@@ -588,6 +659,8 @@ function simulateRun(plan, p, streams, context, replicate, intervention = NO_INT
     sessionStartDeposits: 0, refuelDeposits: 0, refuelTriggers: 0, forcedStops: 0, hazardStops: 0,
     capStops: 0, interventionStops: 0, sessionsDownLarge: 0, tradesOnceDownLarge: 0
   };
+  // Only runs with a hook report these (run.intervention).
+  const hookCounts = { attempts: 0, skippedAttempts: 0, pausesApplied: 0, resetReturns: 0, deferredDeposits: 0, deferredDepositCents: 0 };
   const sessionDrawdowns = [];
   const days = new Set();
   const events = settings.keepEvents ? [] : null;
@@ -621,21 +694,30 @@ function simulateRun(plan, p, streams, context, replicate, intervention = NO_INT
     return Math.max(1, Math.round(baseCents * multiplier * Math.exp(streams.stakeNoise.normal(0, p.stakeDispersion))));
   };
   // A deposit of depositSize x exp(N(0, depositSpread)), raised to `coverCents` when short.
-  const deposit = (at, kind, coverCents = 0) => {
-    let amount = Math.max(1, Math.round(p.depositSize * 100 * Math.exp(streams.deposits.normal(0, p.depositSpread))));
-    if (balance + amount < coverCents) amount = coverCents - balance;
-    if (hook) amount = hook('beforeDeposit', { kind, amountCents: amount }, snapshot()).amountCents;
+  // A deferred deposit (only a hook makes one) has a fixed amount and draws nothing.
+  const deposit = (at, kind, coverCents = 0, fixedCents = null) => {
+    let amount = fixedCents;
+    if (amount === null) {
+      amount = Math.max(1, Math.round(p.depositSize * 100 * Math.exp(streams.deposits.normal(0, p.depositSpread))));
+      if (balance + amount < coverCents) amount = coverCents - balance;
+    }
+    if (hook) amount = checkDeposit(hook('beforeDeposit', { kind, amountCents: amount, seconds: at }, snapshot()), amount);
     if (!(amount > 0)) return;
     emit(at, 'deposit', { amountCents: amount, beforeCents: balance, afterCents: balance + amount });
     balance += amount;
     counts.deposits += 1;
     counts.depositCents += amount;
     if (kind === 'sessionStart') counts.sessionStartDeposits += 1;
-    else counts.refuelDeposits += 1;
+    else if (kind === 'refuel') counts.refuelDeposits += 1;
+    else {
+      hookCounts.deferredDeposits += 1;
+      hookCounts.deferredDepositCents += amount;
+    }
     if (lastLossSeconds !== null && at - lastLossSeconds <= windowSeconds) counts.depositsAfterLoss += 1;
     streak = 0;
   };
 
+  let horizonReached = false;
   for (session = 0; sessionTarget === null || session < sessionTarget; session += 1) {
     const idleDraw = streams.idle.next();
     const delayDraw = streams.idle.next();
@@ -646,93 +728,124 @@ function simulateRun(plan, p, streams, context, replicate, intervention = NO_INT
       const excess = Math.max(1, Math.round(-Math.log(1 - idleDraw) * meanExcessSeconds));
       seconds = (lastEventSeconds ?? seconds) + gapSeconds + excess;
     }
-    if (horizonEnd !== null && seconds >= horizonEnd) break;
-
     running = 0;
     lossRun = 0;
     tradesInSession = 0;
     bucket = 'flat';
+    let deferredCents = 0;
+    if (hook) {
+      const earliestSeconds = session === 0 ? seconds : (lastEventSeconds ?? seconds) + gapSeconds + 1;
+      const proposal = { seconds, earliestSeconds, lastEventSeconds: session === 0 ? null : lastEventSeconds };
+      const decision = checkSessionStart(hook(SESSION_START_POINT, proposal, snapshot()));
+      seconds = Math.max(earliestSeconds, decision.seconds);
+      deferredCents = decision.depositCents;
+    }
+    if (horizonEnd !== null && seconds >= horizonEnd) break;
+
+    const sessionStartSeconds = seconds;
     let lowest = 0;
     let downLarge = false;
+    let attemptsInSession = 0;
     let stake = intendedStake(0);
+    if (money && deferredCents > 0) deposit(seconds, 'deferred', 0, deferredCents);
     if (money && (balance / 100 < lowBalance || balance < stake)) {
       deposit(seconds, 'sessionStart', stake);
       seconds += Math.min(gapSeconds, delayMin + Math.floor(delayDraw * (delayMax - delayMin + 1)));
     }
 
     for (;;) {
-      if (hook) stake = hook('beforeStake', { stakeCents: stake }, snapshot()).stakeCents;
-      if (money && stake > balance) {
+      let skipped = false;
+      if (hook) {
+        const decision = checkStake(hook('beforeStake', { stakeCents: stake }, snapshot()));
+        if (decision.skip) skipped = true;
+        else stake = decision.stakeCents;
+      }
+      if (!skipped && money && stake > balance) {
         // Broke rule: the trader never stakes more than the balance.
         counts.forcedStops += 1;
         break;
       }
 
+      // Every attempt that gets here uses its outcome draws, placed or skipped.
       const outcomeDraw = streams.outcomes.next();
       const payoutDraw = streams.outcomes.normal();
       const lossDraw = streams.outcomes.next();
-      let outcome;
-      let result;
-      if (outcomeDraw < p.winRate) {
-        outcome = 'win';
-        result = Math.max(1, Math.round(stake * p.payoutMultiple * Math.exp(p.payoutSpread * payoutDraw)));
-      } else if (outcomeDraw < p.winRate + p.pushRate) {
-        outcome = 'push';
-        result = 0;
-      } else {
-        outcome = 'loss';
-        result = Math.min(-1, Math.round(stake * lossRatio(plan.lossRatios.points, lossDraw)));
-      }
-
-      if (stake / 100 >= chaseThreshold) {
-        if (lastOutcome === 'loss') counts.chaseEpisodes += 1;
-        else if (lastOutcome === 'win') counts.chaseNoiseFloor += 1;
-      }
-      const before = balance;
-      if (money) balance += result;
-      running += result;
-      emit(seconds, 'trade', { stakeCents: stake, resultCents: result, beforeCents: before, afterCents: balance });
-      counts.trades += 1;
-      counts.totalStakeCents += stake;
-      counts.totalResultCents += result;
-      counts[outcome === 'win' ? 'wins' : outcome === 'loss' ? 'losses' : 'pushes'] += 1;
-      if (downLarge) counts.tradesOnceDownLarge += 1;
-      days.add(Math.floor(seconds / DAY_SECONDS));
-      tradesInSession += 1;
-      lastOutcome = outcome;
-      lossRun = outcome === 'loss' ? lossRun + 1 : 0;
-      streak = outcome === 'loss' ? streak + 1 : 0;
-      if (outcome === 'loss') lastLossSeconds = seconds;
-      if (running < lowest) lowest = running;
-      bucket = drawdownBucket(running / 100, p.baseStake, behavior);
-      if (bucket === 'down_large' && !downLarge) {
-        downLarge = true;
-        counts.sessionsDownLarge += 1;
-      }
-
+      attemptsInSession += 1;
+      hookCounts.attempts += 1;
+      let outcome = null;
       let refuel = false;
       let timingDraw = 0;
-      const triggered = trigger === REFUEL_LOW_BALANCE
-        ? before / 100 >= lowBalance && balance / 100 < lowBalance
-        : trigger === REFUEL_PROXY && streak === streakLength;
-      if (triggered) {
-        counts.refuelTriggers += 1;
-        refuel = streams.refuel.next() < refuelProbability;
-        timingDraw = streams.refuel.next();
+      let triggered = false;
+      if (skipped) {
+        hookCounts.skippedAttempts += 1;
+      } else {
+        let result;
+        if (outcomeDraw < p.winRate) {
+          outcome = 'win';
+          result = Math.max(1, Math.round(stake * p.payoutMultiple * Math.exp(p.payoutSpread * payoutDraw)));
+        } else if (outcomeDraw < p.winRate + p.pushRate) {
+          outcome = 'push';
+          result = 0;
+        } else {
+          outcome = 'loss';
+          result = Math.min(-1, Math.round(stake * lossRatio(plan.lossRatios.points, lossDraw)));
+        }
+
+        if (stake / 100 >= chaseThreshold) {
+          if (lastOutcome === 'loss') counts.chaseEpisodes += 1;
+          else if (lastOutcome === 'win') counts.chaseNoiseFloor += 1;
+        }
+        const before = balance;
+        if (money) balance += result;
+        running += result;
+        emit(seconds, 'trade', { stakeCents: stake, resultCents: result, beforeCents: before, afterCents: balance });
+        counts.trades += 1;
+        counts.totalStakeCents += stake;
+        counts.totalResultCents += result;
+        counts[outcome === 'win' ? 'wins' : outcome === 'loss' ? 'losses' : 'pushes'] += 1;
+        if (downLarge) counts.tradesOnceDownLarge += 1;
+        days.add(Math.floor(seconds / DAY_SECONDS));
+        tradesInSession += 1;
+        lastOutcome = outcome;
+        lossRun = outcome === 'loss' ? lossRun + 1 : 0;
+        streak = outcome === 'loss' ? streak + 1 : 0;
+        if (outcome === 'loss') lastLossSeconds = seconds;
+        if (running < lowest) lowest = running;
+        bucket = drawdownBucket(running / 100, p.baseStake, behavior);
+        if (bucket === 'down_large' && !downLarge) {
+          downLarge = true;
+          counts.sessionsDownLarge += 1;
+        }
+
+        triggered = trigger === REFUEL_LOW_BALANCE
+          ? before / 100 >= lowBalance && balance / 100 < lowBalance
+          : trigger === REFUEL_PROXY && streak === streakLength;
+        if (triggered) {
+          counts.refuelTriggers += 1;
+          refuel = streams.refuel.next() < refuelProbability;
+          timingDraw = streams.refuel.next();
+        }
       }
       const stopDraw = streams.stops.next();
       const latencyDraw = streams.latency.normal();
-      // Time to the next trade, from the latency for this trade's outcome (after-win after a push).
-      const medianMinutes = outcome === 'loss' ? p.reentryLatencyAfterLoss : p.reentryLatencyAfterWin;
+      // Time to the next attempt, from the latency for the last outcome (after-win after a push).
+      const medianMinutes = lastOutcome === 'loss' ? p.reentryLatencyAfterLoss : p.reentryLatencyAfterWin;
       const latency = Math.min(gapSeconds, Math.max(GENERATOR_RULES.minLatencySeconds,
         Math.round(medianMinutes * 60 * Math.exp(p.latencySpread * latencyDraw))));
 
+      // The trader's own stop decision comes first; a policy can end or pause, not overrule it.
       let ends = null;
-      if (hook && hook('afterTrade', { endSession: false }, snapshot()).endSession) ends = 'intervention';
-      else if (stopDraw < p.stopHazard[bucket]) ends = 'hazard';
-      else if (tradesInSession >= settings.maxTradesPerSession) ends = 'cap';
+      if (stopDraw < p.stopHazard[bucket]) ends = 'hazard';
+      else if (attemptsInSession >= settings.maxTradesPerSession) ends = 'cap';
+      let decision = null;
+      if (hook && !skipped) {
+        decision = checkAfterTrade(hook('afterTrade', { endSession: ends !== null }, snapshot()));
+        if (!ends && decision.endSession) ends = 'intervention';
+      }
       if (trace) {
-        trace.push({ session, outcome, stakeCents: stake, outcomeDraw, payoutDraw, lossDraw, stopDraw, latencyDraw, latencySeconds: latency, bucket, triggered, refuel, ends });
+        const row = { session, outcome, stakeCents: stake, outcomeDraw, payoutDraw, lossDraw, stopDraw, latencyDraw, latencySeconds: latency, bucket, triggered, refuel, ends };
+        if (hook) Object.assign(row, { seconds, skipped, runningCents: running, resumeAtSeconds: ends ? null : decision?.resumeAtSeconds ?? null, reset: ends ? false : decision?.reset ?? false });
+        trace.push(row);
       }
       if (ends) {
         counts[`${ends}Stops`] += 1;
@@ -740,17 +853,47 @@ function simulateRun(plan, p, streams, context, replicate, intervention = NO_INT
         break;
       }
 
-      const next = intendedStake(lossRun);
+      const reset = decision !== null && decision.reset;
+      const next = intendedStake(reset ? 0 : lossRun);
       // The refuel deposit lands between this trade and the next, so it doesn't move trade timing.
       if (refuel) deposit(seconds + 1 + Math.floor(timingDraw * (latency - 1)), 'refuel');
       seconds += latency;
+      if (decision !== null && decision.resumeAtSeconds !== null) {
+        // A pause: the next attempt comes when the latency or the pause ends, whichever is later.
+        hookCounts.pausesApplied += 1;
+        if (decision.resumeAtSeconds > seconds) seconds = decision.resumeAtSeconds;
+        if (horizonEnd !== null && seconds >= horizonEnd) {
+          horizonReached = true;
+          break;
+        }
+        if (reset) {
+          // The return starts a new session: the reference point starts over.
+          hookCounts.resetReturns += 1;
+          counts.sessions += 1;
+          sessionDrawdowns.push(-lowest / 100);
+          session += 1;
+          running = 0;
+          lossRun = 0;
+          tradesInSession = 0;
+          attemptsInSession = 0;
+          bucket = 'flat';
+          lowest = 0;
+          downLarge = false;
+        }
+      }
       stake = next;
     }
 
     if (tradesInSession > 0) {
       counts.sessions += 1;
       sessionDrawdowns.push(-lowest / 100);
+    } else if (lastEventSeconds === null || lastEventSeconds < sessionStartSeconds) {
+      // A session with no event moves the clock: the next idle time runs from its start.
+      // Without a hook every session trades (the session-start deposit covers the first
+      // stake), so this only happens when a policy reduces that deposit.
+      lastEventSeconds = sessionStartSeconds;
     }
+    if (horizonReached) break;
   }
 
   const maxDrawdown = sessionDrawdowns.length ? Math.max(...sessionDrawdowns) : null;
@@ -790,6 +933,7 @@ function simulateRun(plan, p, streams, context, replicate, intervention = NO_INT
   };
 
   const run = { metrics, refuelTriggers: counts.refuelTriggers };
+  if (hook) run.intervention = { ...hookCounts, interventionStops: counts.interventionStops, horizonReachedInPause: horizonReached };
   if (events) {
     run.events = events.map((event, index) => {
       const row = {
@@ -906,6 +1050,55 @@ function summarizeTrader(plan, runs, dataLabel, settings) {
 // --- Entry points --------------------------------------------------------------------------------
 
 /**
+ * Validates the fit and options and plans every trader, without simulating. Shared by
+ * simulateTwinV2 and the policy layer (policy-sim.mjs), so both run exactly the same code.
+ * Returns { settings, behavior, context, plans, assumptions }; each plan is internal.
+ * Throws on an invalid fit or options.
+ */
+export function prepareSimulation(fit, options = {}) {
+  validateFit(fit);
+  const settings = resolveOptions(fit, options);
+  const behavior = { ...DEFAULT_BEHAVIOR_OPTIONS, ...fit.behaviorOptions };
+  const context = { behavior, settings, horizonEndSeconds: settings.horizonEndSeconds };
+  return {
+    settings,
+    behavior,
+    context,
+    plans: settings.twins.map((twin) => planTrader(twin, settings, behavior)),
+    assumptions: globalAssumptions(settings)
+  };
+}
+
+/**
+ * One run of one simulable trader: replicate `replicate` of `plan` from prepareSimulation.
+ * makeIntervention, when given, is called once with runInfo { traderToken, replicate,
+ * runSeed, parameters, moneySimulated, behavior, horizonEndSeconds, policyStream } and
+ * returns the run's hook (INTERVENTION_POINTS, SESSION_START_POINT). Without it the run
+ * uses NO_INTERVENTION and is exactly a simulateTwinV2 run. Returns { replicate, seed,
+ * renormalized, parameters, metrics, refuelTriggers }, plus `intervention` (hook
+ * accounting) with a hook, and events and trace with keepEvents.
+ */
+export function simulateReplicate(prepared, plan, replicate, makeIntervention = null) {
+  const { settings, context } = prepared;
+  const runSeed = stableSeed(`${settings.seed}:${plan.traderToken}:${replicate}`);
+  const { values, renormalized } = drawParameters(plan, runSeed, settings);
+  const parameters = runParameters(plan, values);
+  const streams = makeStreams(runSeed, settings.reseedStreams);
+  const intervention = makeIntervention === null ? NO_INTERVENTION : makeIntervention({
+    traderToken: plan.traderToken,
+    replicate,
+    runSeed,
+    parameters,
+    moneySimulated: plan.mechanisms.money.simulated,
+    behavior: context.behavior,
+    horizonEndSeconds: context.horizonEndSeconds,
+    policyStream: streams.policy
+  });
+  const run = simulateRun(plan, parameters, streams, context, replicate, intervention);
+  return { replicate, seed: runSeed, renormalized, parameters, ...run };
+}
+
+/**
  * Simulates every twin in an estimateTwins fit (model twin-0.2.1). Options are in
  * SIMULATION_DEFAULTS. Returns { dataLabel, modelVersion, simulatorVersion,
  * behaviorVersion, seed, replicates, uncertainty, horizon, start, maxTradesPerSession,
@@ -919,27 +1112,18 @@ function summarizeTrader(plan, runs, dataLabel, settings) {
  * Throws on an invalid fit or options.
  */
 export function simulateTwinV2(fit, options = {}) {
-  validateFit(fit);
-  const settings = resolveOptions(fit, options);
-  const behavior = { ...DEFAULT_BEHAVIOR_OPTIONS, ...fit.behaviorOptions };
-  const context = { behavior, settings, horizonEndSeconds: settings.horizonEndSeconds };
+  const prepared = prepareSimulation(fit, options);
+  const { settings } = prepared;
 
   const traders = [];
   const runsByTrader = [];
-  for (const twin of settings.twins) {
-    const plan = planTrader(twin, settings, behavior);
+  for (const plan of prepared.plans) {
     if (!plan.simulable) {
       traders.push({ traderToken: plan.traderToken, dataLabel: fit.dataLabel, simulable: false, reasons: plan.reasons });
       continue;
     }
     const runs = [];
-    for (let replicate = 0; replicate < settings.replicates; replicate += 1) {
-      const runSeed = stableSeed(`${settings.seed}:${plan.traderToken}:${replicate}`);
-      const { values, renormalized } = drawParameters(plan, runSeed, settings);
-      const parameters = runParameters(plan, values);
-      const run = simulateRun(plan, parameters, makeStreams(runSeed, settings.reseedStreams), context, replicate);
-      runs.push({ replicate, seed: runSeed, renormalized, parameters, ...run });
-    }
+    for (let replicate = 0; replicate < settings.replicates; replicate += 1) runs.push(simulateReplicate(prepared, plan, replicate));
     traders.push(summarizeTrader(plan, runs, fit.dataLabel, settings));
     runsByTrader.push(runs);
   }
@@ -957,7 +1141,7 @@ export function simulateTwinV2(fit, options = {}) {
     maxTradesPerSession: settings.maxTradesPerSession,
     reseedStreams: { ...settings.reseedStreams },
     claim: 'Simulation under stated assumptions. Not a causal claim.',
-    assumptions: globalAssumptions(settings),
+    assumptions: prepared.assumptions,
     metricDefinitions: SIMULATION_METRICS,
     traders,
     population: {

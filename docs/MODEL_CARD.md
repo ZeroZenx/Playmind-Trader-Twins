@@ -4,6 +4,7 @@ Two models and two simulators live in `src/engine/`:
 
 - **twin-0.2.1** (`estimate.mjs`): a behavioral twin per trader, a small set of interpretable parameters with uncertainty. twin-0.2.0 plus `latencySpread` and `depositSpread`, which the simulator needs.
 - **simulator-0.2.0** (`simulate.mjs`, `simulateTwinV2`): simulates twin-0.2.1 twins trade by trade, so a twin reacts to its own losses. Described under Simulation.
+- **policy-0.2.0** (`policy-sim.mjs`, `comparePolicyV2`, `runPolicySweep`): runs responsible-trading policies on simulator-0.2.0, with every trader response a named, swept assumption. Described under Policy simulation.
 - **Transparent behavioral baseline** (`twin.mjs`, model version 0.1.0, reported as baseline-0.1): aggregate summaries and a seeded simulator whose stakes don't depend on outcomes. It is kept for comparison and described at the end.
 
 ## Intended use
@@ -124,7 +125,7 @@ The first session starts at a uniform time within 24 hours of the start. Each la
 
 After each trade, the running session result (net of deposits) is bucketed with `drawdownBucket` against the run's `baseStake`, and the session ends with probability `stopHazard` for that bucket. Then the broke rule ends it if the next stake is larger than the balance; stakes are never capped. A safety cap ends a session at `maxTradesPerSession` trades. Hazard stops, forced stops, and cap stops are counted separately. A session starts with a deposit of `depositSize` × exp(N(0, `depositSpread`)), raised to cover the first stake if short, when the balance is below `lowBalanceStakeMultiple` × `baseStake` or below the first stake. With balances in training, a trade that takes the balance from at or above that threshold to below it triggers a refuel with `refuelProbability`. Without them, the refuel trigger is `losingStreakLength` consecutive losses, with `refuelAfterLosingStreak` as its probability, labelled `losingStreak (proxy)`. The starting balance is the supplied last observed balance, or 0.
 
-Each kind of decision (parameters, outcomes, stake noise, latency, stops, refuel, deposits, idle time) draws from its own random stream, a fixed number of times per event. A policy that changes one decision therefore leaves every other decision's draws where they were, so Prompt 5 can compare policy and no-policy runs on common random numbers. There is one hook where those policies will act (before a stake, before a deposit, after a trade). In simulator-0.2.0 it does nothing.
+Each kind of decision (parameters, outcomes, stake noise, latency, stops, refuel, deposits, idle time) draws from its own random stream, a fixed number of times per event. A policy that changes one decision therefore leaves every other decision's draws where they were, so policy and no-policy runs can be compared on common random numbers. Policies act through one hook (before a session, before a stake, before a deposit, after a trade), which `simulateTwinV2` never calls; the policy layer below uses it.
 
 Parameter statuses decide where each run's values come from. `estimated` and `prior_only` parameters draw from `posterior`. A `not_estimable` parameter with a `fallback` draws from the population prior, and the trader's assumptions list it as "population prior, not this trader". A `not_estimable` parameter with no fallback switches its mechanism off, and the result says so. If the stake, outcome, latency, stop, or session mechanism can't be simulated, the trader isn't simulable and gets `{ simulable: false, reasons }`. A trader with no realized outcome at all is never simulable, even when fallbacks exist, because every outcome-driven parameter would be the population's.
 
@@ -148,6 +149,76 @@ Per run, the harm metrics are the deepest session drawdown (in currency and in b
 - Without a supplied starting balance, every trader starts at 0 with a session-start deposit.
 - Reproducing synthetic traders shows the simulator implements the model. It says nothing about whether real traders behave like the model.
 - Simulation results built from a CUSTOMER fit are customer-derived data and stay out of the repo.
+
+## Policy simulation (policy-0.2.0)
+
+`comparePolicyV2(fit, { policy, assumptions }, options)` and `runPolicySweep(fit, sweep, options)` in `src/engine/policy-sim.mjs` run responsible-trading policies on simulator-0.2.0 twins and compare each with the same twins under no policy. ADR-013 in `docs/DECISIONS.md` gives the reasons for each choice. There is no intervention data, so every way a trader responds to a policy is an assumption, named, given a default, swept across a range, and shown with every result. Results are simulations under stated assumptions. They are never causal claims, and never a recommendation to act on any trader.
+
+### Inputs
+
+- An `estimateTwins` fit (twin-0.2.1), with simulator-0.2.0's options (seed, replicates, uncertainty, start, starting balances), except that the horizon must be in days.
+- A policy, validated by `validatePolicyV2`, with thresholds in currency:
+  - `cooldown`: `durationMinutes`, `lossStreak` (default 3), and optionally `drawdownThreshold`.
+  - `deposit_limit`: `dailyLimit` per UTC day.
+  - `stake_limit`: `maxStake`.
+  - `session_loss_limit`: `lossLimit`.
+- Response assumptions, validated by `validateResponseAssumptions`. Each has a default and a default range:
+  - Cooldown: a rebound multiplier on stakes after the trader returns, the probability of leaving for the day, and the reference point (`carry` or `reset`).
+  - Stake limit: the probability of resubmitting at the cap rather than skipping.
+  - Deposit limit: the share of a blocked deposit made on a later day.
+  - Session loss limit: the probability of a new session within the hour.
+- For a sweep: the policies, their settings (defaults in the module), the design (one assumption at a time, or the full grid), and the primary harm and activity metrics.
+
+### Method
+
+A policy acts only through the simulator's hook. It can delay or move a session's start, cap or skip a stake, cut a deposit, and end or pause a session after a trade. It can never overrule the trader's own decision to stop. Each run builds its own policy instance. All of the policy's randomness, including the response draws, comes from a separate policy stream, a fixed number of draws per policy event, so cells with different assumption values share the same draws.
+
+Every comparison is paired. For each trader and replicate, the policy run and the no-policy run use the same seed, the same parameter draws, and the same random streams for outcomes, stake noise, latency, stopping, refuel, deposits, and idle time. The no-policy run is computed once and reused for every cell. Draws are aligned attempt by attempt: a placed, capped, or skipped attempt uses the same outcome, stop, and latency draws it would have used without the policy. A capped stake keeps its own outcome, with the payout or loss applied to the capped stake. Until the policy first acts, the two runs are identical. After that, they differ only through what the policy and the assumed responses change, plus the noise those changes move around.
+
+The cooldown fires the first time the session reaches its losing streak or drawdown threshold, not again while the condition holds. If the trader would have continued, they either leave for the day (no new session until after the next UTC midnight, then their normal idle time) or come back when the cooldown ends. With `carry` the session continues from where it was. With `reset` the trader returns in a new session, flat and with no losing run. A stake over the cap is resubmitted at the cap or skipped. A deposit that would take the day past its limit is cut, and a share of the cut amount lands at the start of the trader's first session on a later UTC day. A session that reaches its loss limit ends after that trade. The next one starts within an hour (after the session gap) or after the normal idle time.
+
+For each harm metric the result is a harm reduction, 1 − policy ÷ baseline. For each activity metric it is activity retained, policy ÷ baseline. Paired differences come in natural units. Per trader, the ratio is computed in each replicate and summarized by its median and 10th and 90th percentiles. For the population, each replicate is summed across traders first (drawdowns are averaged), then the ratio is taken, then the percentiles. A zero baseline gives no ratio, never 0 or 1.
+
+The default trade-off chart plots total net loss reduction against total stake retained. Under a negative edge, net loss falls roughly in proportion to stake, so a policy that only cuts activity sits on the line harm reduction = 1 − activity retained. The distance above that line (`beyondActivityCut`) separates a policy that cuts losses more than play. For each policy, the sweep compares how far the primary harm reduction moves across the policy settings with how far it moves across each assumption's range. It then names the largest in a plain sentence.
+
+### Outputs
+
+Every result carries the fit's data label, the model, simulator, and policy versions, the seed, the replicate count, the horizon, the claim, simulator-0.2.0's assumptions, and the policy layer's assumptions. Each cell carries the validated policy config and every response assumption with its value and whether it is the default. Each cell also carries:
+
+- population and per-trader harm reduction, activity retained, and paired differences for every harm and activity metric;
+- the primary pair, with `beyondActivityCut`;
+- accounting of what the policy did, such as triggers, pauses, leaves, skips, and blocked, carried, and deferred deposits.
+
+A sweep adds, for each policy, a chart (one series per value of each swept assumption, with points over the settings and bands) and a driver statement. Traders keep their labels (all-cause stops, proxy refuel, no money model, not simulable). Each trader's parameter estimates are listed, so a report can group traders by archetype or parameter range rather than by token. `npm run policy:sweep` writes the default sweep on a SYNTHETIC population to gitignored `analysis/output/policy-sweep/` and prints its runtime.
+
+### Validation
+
+`test/policy-sim.test.mjs` checks the following:
+
+- Config validation.
+- A hook that changes nothing, and a policy that never fires, both give exactly the no-policy run.
+- A policy run matches its baseline until the policy first acts.
+- Each policy does what it says.
+- A cooldown that only delays never raises trades, stake, or chase episodes in any paired run.
+- A high rebound can raise harm.
+- The reference-point finding.
+- Population aggregation.
+- Determinism.
+- The money-off path.
+- Labels.
+
+`test/policy-sweep.test.mjs` runs the shared sweep module and the script at a small scale. These tests check that the mechanics implement the stated assumptions on SYNTHETIC twins. They don't check that real traders respond that way.
+
+### Limitations
+
+- There is no intervention data. Every response to a policy is an assumption, and so is every range it is swept across. A result that moves more with an assumption than with the policy setting is driven by what we assumed, and the driver statement says so.
+- The default sweep varies one assumption at a time, with the others at their defaults. It misses interactions between assumptions (for example, a reset reference point combined with a rebound). The grid design covers them at a higher cost.
+- The paired bands reflect the twin's parameter uncertainty and process noise. They don't reflect uncertainty about the responses, which only the sweep shows.
+- Realized net loss over a horizon is mostly luck, and paired runs share outcome draws only until they diverge. Net-loss bands are wide, and narrow populations need many replicates.
+- Session drawdown is measured from the trader's reference point. Under `reset` it restarts at the return by definition, and under `carry` a pause longer than the session gap would look like two sessions in event data.
+- Thresholds are the same currency amount for every trader, one policy runs at a time, and responses are the same for every trader. No trader adapts over the horizon.
+- Without balance fields, stopping is all-cause and double-counted in low-balance states, and policies that act on low balances inherit that. Without a money model, a deposit limit is not applicable.
+- Policy results from a CUSTOMER fit are customer-derived data and stay out of the repo.
 
 ## Transparent behavioral baseline (baseline-0.1)
 
