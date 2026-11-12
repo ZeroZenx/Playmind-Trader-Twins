@@ -13,7 +13,7 @@ import {
   runTwinRecovery
 } from '../src/synthetic/twin-recovery.mjs';
 
-// Parameter recovery for twin-0.2.0 on SYNTHETIC traders with known parameters. The
+// Parameter recovery for twin-0.2.1 on SYNTHETIC traders with known parameters. The
 // recovery function is shared with scripts/twin-recovery.mjs (npm run twin:recovery),
 // which writes the full results to gitignored local output. Recovery numbers live only
 // here, as thresholds, and in that output: never in docs or commit messages.
@@ -39,11 +39,15 @@ const MATERIAL_SHRINKAGE_WEIGHT = 0.95;
 // The voluntary stop sample may keep at most this share of the truth's forced stops.
 const MAX_RESIDUAL_FORCED_STOP_SHARE = 0.05;
 
+// latencySpread (twin-0.2.1) is in the band with a clear margin, so it is asserted. depositSpread
+// (twin-0.2.1) is reported in the recovery output but not asserted: it sits near the upper edge,
+// and about a third of its intervals are prior-only (traders with fewer than 2 deposits).
 const COVERAGE_TARGETS = [
   'chaseCoefficient',
   'escalationPerLoss',
   'reentryLatencyAfterLoss',
   'reentryLatencyAfterWin',
+  'latencySpread',
   'baseStake',
   'winRate',
   'meanIdleMinutes'
@@ -204,7 +208,7 @@ test('npm run twin:recovery writes SYNTHETIC results to the directory it is give
   try {
     const run = spawnSync(process.execPath, ['scripts/twin-recovery.mjs', '--traders', '30', '--seed', '5', '--out', directory], { encoding: 'utf8' });
     assert.equal(run.status, 0, run.stderr);
-    assert.match(run.stdout, /twin-0\.2\.0 parameter recovery \(SYNTHETIC\)/);
+    assert.match(run.stdout, /twin-0\.2\.1 parameter recovery \(SYNTHETIC\)/);
     const files = (await readdir(directory)).sort();
     assert.deepEqual(files, ['twin-recovery-seed5-traders30.json', 'twin-recovery-seed5-traders30.traders.jsonl']);
     const summary = JSON.parse(await readFile(join(directory, files[0]), 'utf8'));

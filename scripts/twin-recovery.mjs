@@ -1,5 +1,5 @@
 /**
- * twin-0.2.0 parameter recovery on SYNTHETIC traders.
+ * twin-0.2.1 parameter recovery on SYNTHETIC traders.
  *
  *   npm run twin:recovery -- [--seed N] [--traders N] [--out DIR]
  *

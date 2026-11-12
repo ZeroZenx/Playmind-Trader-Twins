@@ -2,7 +2,7 @@
 
 Label: **SYNTHETIC**. Module: `src/synthetic/behavioral-generate.mjs`, generator version `behavioral-synthetic-0.1.0`.
 
-The older generator in `src/synthetic/generate.mjs` draws stakes that don't depend on outcomes, so it can't test whether we recover behavioral parameters. This generator simulates each trader trade by trade from explicit parameters. Each parameter means the same thing as the matching `behavior-0.2.0` signal in `src/engine/behavior.mjs`. The twin-0.2.0 estimator can then be checked against known true values. The demo keeps using `generate.mjs` until Prompt 7.
+The older generator in `src/synthetic/generate.mjs` draws stakes that don't depend on outcomes, so it can't test whether we recover behavioral parameters. This generator simulates each trader trade by trade from explicit parameters. Each parameter means the same thing as the matching `behavior-0.2.0` signal in `src/engine/behavior.mjs`. The twin estimator (twin-0.2.1) can then be checked against known true values, and the simulator can be run on those true values (`src/synthetic/truth-twins.mjs`). The demo keeps using `generate.mjs` until Prompt 7.
 
 ## Use
 
@@ -168,11 +168,11 @@ About 40% of drawn chase coefficients are above 1 and 60% below, so the populati
 
 ## Reading the signals against the truth
 
-The signals don't equal the parameters. The generator tests check direction only. Recovery belongs to the twin-0.2.0 estimator (`src/engine/estimate.mjs`, ADR-011): `test/twin-recovery.test.mjs` and `npm run twin:recovery` fit a 500-trader population with `sessionsPerTrader: { min: 2, max: 150, scale: 'log' }` and compare estimates and intervals with the truth. ADR-010 lists the generator choices the estimator has to account for.
+The signals don't equal the parameters. The generator tests check direction only. Recovery belongs to the twin estimator (twin-0.2.1, `src/engine/estimate.mjs`, ADR-011 and ADR-012): `test/twin-recovery.test.mjs` and `npm run twin:recovery` fit a 500-trader population with `sessionsPerTrader: { min: 2, max: 150, scale: 'log' }` and compare estimates and intervals with the truth. ADR-010 lists the generator choices the estimator has to account for.
 
 - `chaseCoefficient` vs signal 1. Signal 1 divides each stake by the median of the previous 20 stakes, and that median includes chase-inflated stakes. `afterLoss.value` and `lossMinusWin.value` are therefore not the coefficient. `lossMinusWin.logRatioDifference` is the closer match, because the rolling median roughly cancels in the difference.
 - `escalationPerLoss` vs signal 6. Signal 6 compares each stake with the stake after the first loss of the run, which cancels the base stake and the chase term. Forced stops cut long, expensive losing runs short.
 - Latencies vs signal 2. Compare with `reentryLatency.withinSession`. `anySession` includes the idle time between sessions. Signal 2 skips pushes, while the generator uses the after-win latency after a push.
-- `stopHazard` vs signal 4. The generator's bucket edges use `baseStake`, but the signal's use the observed median stake: higher than `baseStake` for chasers, lower for shrinkers. Observed stop rates also include forced stops. `realized.tradesByBucket` and `realized.stops` give the generator-side counts. Hazard plus forced stops per trade comes from the same trades the estimator sees, so it is a descriptive check, not a parameter to measure coverage against. twin-0.2.0 estimates the voluntary hazard and is compared with `stopHazard`.
+- `stopHazard` vs signal 4. The generator's bucket edges use `baseStake`, but the signal's use the observed median stake: higher than `baseStake` for chasers, lower for shrinkers. Observed stop rates also include forced stops. `realized.tradesByBucket` and `realized.stops` give the generator-side counts. Hazard plus forced stops per trade comes from the same trades the estimator sees, so it is a descriptive check, not a parameter to measure coverage against. The twin estimates the voluntary hazard and is compared with `stopHazard`.
 - `refuelProbability` vs signal 5. Refuel deposits always land inside the window, and session-start deposits never do. A trader with `refuelProbability` 0 therefore has an observed refuel rate of exactly 0. The generator's trigger uses `baseStake`, and the signal's uses the observed median stake.
 - `depositAmount`. Session-start and refuel deposits are drawn the same way, except for raised session-start deposits.

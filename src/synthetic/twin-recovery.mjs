@@ -1,5 +1,5 @@
 /**
- * Parameter recovery for twin-0.2.0 on SYNTHETIC traders with known parameters.
+ * Parameter recovery for twin-0.2.1 on SYNTHETIC traders with known parameters.
  *
  * test/twin-recovery.test.mjs and scripts/twin-recovery.mjs both call this module,
  * so the test thresholds and the local results file come from one computation. It
@@ -39,7 +39,7 @@ export const RECOVERY_DEFAULTS = deepFreeze({
 });
 
 // The generator's minimum idle time between sessions (docs/BEHAVIORAL-SYNTHETIC.md, Timing).
-function minIdleMinutes(behaviorOptions) {
+export function minIdleMinutes(behaviorOptions) {
   const seconds = Math.ceil(Math.max(behaviorOptions.sessionGapMinutes, behaviorOptions.refuelWindowMinutes) * 60) + 60;
   return seconds / 60;
 }
@@ -55,7 +55,9 @@ export const RECOVERY_TARGETS = deepFreeze({
   escalationPerLoss: { scale: 'log', truth: (p) => p.escalationPerLoss },
   reentryLatencyAfterLoss: { scale: 'log', truth: (p) => p.reentryLatencyAfterLoss },
   reentryLatencyAfterWin: { scale: 'log', truth: (p) => p.reentryLatencyAfterWin },
+  latencySpread: { scale: 'log', truth: (p) => p.latencyNoise },
   depositSize: { scale: 'log', truth: (p) => p.depositAmount },
+  depositSpread: { scale: 'log', truth: (p) => p.depositNoise },
   winRate: { scale: 'probability', truth: (p) => p.winProbability },
   pushRate: { scale: 'probability', truth: (p) => p.pushProbability },
   payoutMultiple: { scale: 'log', truth: (p) => p.payoutMultiple },
@@ -326,7 +328,7 @@ export function runTwinRecovery(options = {}) {
 // Parameters that need a realized outcome (TWIN_PARAMETER_DEFINITIONS), with stopHazard per bucket.
 export const OUTCOME_DEPENDENT_TARGETS = Object.freeze([
   'baseStake', 'stakeDispersion', 'chaseCoefficient', 'escalationPerLoss', 'reentryLatencyAfterLoss',
-  'reentryLatencyAfterWin', 'refuelProbability', 'refuelAfterLosingStreak', 'winRate', 'pushRate',
+  'reentryLatencyAfterWin', 'latencySpread', 'refuelProbability', 'refuelAfterLosingStreak', 'winRate', 'pushRate',
   'payoutMultiple', 'payoutSpread', ...DRAWDOWN_BUCKETS.map((bucket) => `stopHazard.${bucket}`)
 ]);
 
@@ -375,7 +377,7 @@ function percent(value) {
 
 /** A short plain-text summary of runRecoveryScenarios output, for the console. */
 export function formatRecoverySummary(report) {
-  const lines = [`twin-0.2.0 parameter recovery (${report.label})`];
+  const lines = [`${report.modelVersion} parameter recovery (${report.label})`];
   for (const [name, results] of Object.entries(report.scenarios)) {
     const { chase, coverage, stops, scenario } = results;
     lines.push('');

@@ -14,7 +14,7 @@ import {
 import { betaCdf, betaQuantile, digamma, gammaCdf, gammaQuantile, trigamma } from '../src/engine/stats.mjs';
 import { generateBehavioralDataset } from '../src/synthetic/behavioral-generate.mjs';
 
-// Unit tests for twin-0.2.0 on SYNTHETIC data. Recovery against known parameters is in
+// Unit tests for twin-0.2.1 on SYNTHETIC data. Recovery against known parameters is in
 // test/twin-recovery.test.mjs.
 
 const LABEL = 'SYNTHETIC';
@@ -66,7 +66,7 @@ test('dataLabel is required, validated, and carried into every output', () => {
     assert.equal(result.priors.dataLabel, label);
     assert.ok(result.twins.every((twin) => twin.dataLabel === label && twin.modelVersion === TWIN_MODEL_VERSION));
   }
-  assert.equal(fit.modelVersion, 'twin-0.2.0');
+  assert.equal(fit.modelVersion, 'twin-0.2.1');
   assert.equal(fit.behaviorVersion, 'behavior-0.2.0');
 });
 
@@ -225,6 +225,38 @@ test('within-session latency uses the median, which latencies clamped at the ses
   assert.equal(record.n, 5);
   assert.ok(Math.abs(record.raw - 4) < 1e-9, `raw ${record.raw}`);
   assert.equal(result.twins[0].inputs.sessionCount, 1);
+});
+
+test('latencySpread is the pooled MAD around each side\'s median observation, which a cut-off latency does not move', () => {
+  // Latencies after a win: 1, 2, 4, 8, and then 30 or 29 minutes. The median observation (4) is
+  // left out; the rest deviate by log 4, log 2, log 2, and log(30 / 4) or log(29 / 4).
+  const spreadFor = (last) => {
+    const trade = eventsFor(`spread${last}`);
+    const events = [trade(0, 10, 5), trade(1, 10, 5), trade(3, 10, 5), trade(7, 10, 5), trade(15, 10, 5), trade(15 + last, 10, 5)];
+    return estimateTwins(events, { dataLabel: LABEL }).twins[0].parameters.latencySpread;
+  };
+  const expected = 1.4826 * (Math.log(2) + Math.log(4)) / 2;
+  for (const last of [30, 29]) {
+    const record = spreadFor(last);
+    assert.equal(record.n, 4);
+    assert.ok(Math.abs(record.raw - expected) < 1e-9, `raw ${record.raw}`);
+    assert.equal(record.posterior.family, 'normal');
+  }
+  assert.ok(TWIN_PARAMETER_DEFINITIONS.latencySpread.requires.includes('realized_result'));
+  assert.ok(TWIN_PARAMETER_DEFINITIONS.depositSpread.requires.includes('deposit_amount'));
+});
+
+test('depositSpread is the log-scale SD of deposit amounts, with the same shrinkage as stakeDispersion', () => {
+  let checked = 0;
+  for (const twin of fit.twins) {
+    const record = twin.parameters.depositSpread;
+    if (record.status !== 'estimated') continue;
+    assert.equal(record.n, twin.parameters.depositSize.n);
+    assert.ok(record.n >= 2);
+    checked += 1;
+  }
+  assert.ok(checked > 0);
+  assert.ok(fit.priors.depositSpread && fit.priors.latencySpread);
 });
 
 test('mean idle time is sessionGapMinutes plus the mean excess idle time', () => {

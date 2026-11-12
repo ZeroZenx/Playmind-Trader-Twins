@@ -1,5 +1,9 @@
 /**
- * Twin parameter estimation, model version twin-0.2.0.
+ * Twin parameter estimation, model version twin-0.2.1.
+ *
+ * twin-0.2.1 is twin-0.2.0 plus two spreads the Prompt 4 simulator needs:
+ * latencySpread and depositSpread (ADR-012). Every other parameter is fitted
+ * exactly as in twin-0.2.0.
  *
  * A twin is a small set of interpretable behavioral parameters per trader. Each
  * parameter has a point estimate, a 90% interval, a sample size n, a shrinkage
@@ -50,7 +54,7 @@ import {
   variance
 } from './stats.mjs';
 
-export const TWIN_MODEL_VERSION = 'twin-0.2.0';
+export const TWIN_MODEL_VERSION = 'twin-0.2.1';
 export const DATA_LABELS = Object.freeze(['SYNTHETIC', 'OBSERVATIONAL', 'CUSTOMER']);
 export const PARAMETER_STATUSES = Object.freeze(['estimated', 'prior_only', 'not_estimable']);
 
@@ -78,6 +82,8 @@ export const ESTIMATE_CONSTANTS = Object.freeze({
 
 const Z = 1.6448536269514722; // standard normal 95th percentile: a two-sided 90% interval
 const TAIL = (1 - ESTIMATE_CONSTANTS.intervalLevel) / 2;
+// The MAD as a normal SD: 1.4826 x MAD, with asymptotic Var(log SD) = 1.3605 / n for normal data.
+const MAD_LOG_VARIANCE = 1.3605;
 
 function deepFreeze(value) {
   if (value && typeof value === 'object' && !Object.isFrozen(value)) {
@@ -138,6 +144,13 @@ export const TWIN_PARAMETER_DEFINITIONS = deepFreeze({
     requires: [...BASE_FIELDS, 'realized_result'],
     fallback: 'prior'
   },
+  latencySpread: {
+    description: 'Log-scale standard deviation of within-session latencies after a loss or a win, pooled over both: the noise on both latencies. 1.4826 x the median absolute deviation from each side\'s median observation, which latencies cut off at sessionGapMinutes don\'t move while they stay above each side\'s upper quartile.',
+    unit: 'log SD',
+    method: 'normal-normal on log SD (MAD-based)',
+    requires: [...BASE_FIELDS, 'realized_result'],
+    fallback: 'prior'
+  },
   stopHazard: {
     description: 'Probability that the session ends after a trade, by drawdown bucket, with edges in units of the estimated baseStake. Voluntary (trades the trader probably could not follow are left out) when every trade has balance fields; otherwise all-cause, including stops from running out of money.',
     unit: 'probability per bucket',
@@ -165,6 +178,13 @@ export const TWIN_PARAMETER_DEFINITIONS = deepFreeze({
     description: 'Median deposit amount.',
     unit: 'currency',
     method: 'normal-normal, log scale',
+    requires: [...BASE_FIELDS, 'deposit_amount'],
+    fallback: 'prior'
+  },
+  depositSpread: {
+    description: 'Log-scale standard deviation of deposit amounts: the noise on every deposit.',
+    unit: 'log SD',
+    method: 'normal-normal on log SD',
     requires: [...BASE_FIELDS, 'deposit_amount'],
     fallback: 'prior'
   },
@@ -734,6 +754,39 @@ function fitLatency(traders, side, name) {
   return latency.prior;
 }
 
+/**
+ * latencySpread (twin-0.2.1, ADR-012). Each side (after a loss, after a win) with 2+
+ * within-session latencies is centered at its median observation (the lower middle one
+ * for an even count), which is then left out: its zero deviation would bias the MAD low in
+ * small samples. SD = 1.4826 x the median of the remaining absolute log deviations, pooled
+ * over both sides, with n = their count and Var(log SD) = 1.3605 / n (the MAD's asymptotic
+ * variance for normal data). A latency cut off at sessionGapMinutes doesn't move it while
+ * the cutoff stays above the side's upper quartile.
+ */
+function fitLatencySpread(traders) {
+  const floor = ESTIMATE_CONSTANTS.minLatencyMinutes;
+  const spread = shrinkNormal(traders.map((trader) => {
+    const reason = inputGap(trader, ['outcomes']);
+    if (reason) return { reason };
+    const deviations = [];
+    for (const side of ['loss', 'win']) {
+      const logs = trader.record.reentryLatency.withinSession[side]
+        .map((minutes) => Math.log(Math.max(minutes, floor)))
+        .sort((a, b) => a - b);
+      if (logs.length < 2) continue;
+      const middle = Math.floor((logs.length - 1) / 2);
+      logs.forEach((value, index) => { if (index !== middle) deviations.push(Math.abs(value - logs[middle])); });
+    }
+    const n = deviations.length;
+    if (!n) return { n: 0, y: null, se2: null, emptyReason: 'needs 2 or more within-session latencies after a loss or after a win' };
+    const sd = 1.4826 * median(deviations);
+    if (!(sd > 0)) return { n, y: null, se2: null, emptyReason: 'within-session latencies have no spread (median absolute deviation 0)' };
+    return { n, y: Math.log(sd), se2: MAD_LOG_VARIANCE / n };
+  }));
+  traders.forEach((trader, index) => { trader.parameters.latencySpread = spread.results[index]; });
+  return spread.prior;
+}
+
 function fitDeposits(traders) {
   const summaries = traders.map((trader) => {
     const { deposits } = trader.record;
@@ -748,8 +801,13 @@ function fitDeposits(traders) {
     if (!summary.n) return { n: 0, y: null, se2: null, emptyReason: 'no deposit with a positive amount' };
     return { n: summary.n, y: summary.center, se2: samplingVariance(summary, pooled) };
   }));
-  traders.forEach((trader, index) => { trader.parameters.depositSize = deposit.results[index]; });
-  return deposit.prior;
+  // depositSpread (twin-0.2.1): fitted like stakeDispersion, on the same log amounts.
+  const spread = shrinkNormal(summaries.map((summary) => (summary.reason ? summary : logSdRaw(summary))));
+  traders.forEach((trader, index) => {
+    trader.parameters.depositSize = deposit.results[index];
+    trader.parameters.depositSpread = spread.results[index];
+  });
+  return { depositSize: deposit.prior, depositSpread: spread.prior };
 }
 
 function fitPayout(traders) {
@@ -1038,7 +1096,7 @@ function observedSessionsPerDay(record) {
 // --- Entry point -------------------------------------------------------------------------
 
 /**
- * Fits twin-0.2.0 parameters for every trader in `events`.
+ * Fits twin-0.2.1 parameters for every trader in `events`.
  *
  * options:
  * - dataLabel (required): 'SYNTHETIC', 'OBSERVATIONAL', or 'CUSTOMER'. Carried into
@@ -1077,9 +1135,10 @@ export function estimateTwins(events, options) {
   priors.escalationPerLoss = fitEscalation(traders);
   priors.reentryLatencyAfterLoss = fitLatency(traders, 'loss', 'reentryLatencyAfterLoss');
   priors.reentryLatencyAfterWin = fitLatency(traders, 'win', 'reentryLatencyAfterWin');
+  priors.latencySpread = fitLatencySpread(traders);
   priors.stopHazard = fitStops(traders, behaviorOptions);
   Object.assign(priors, fitRefuel(traders, behaviorOptions));
-  priors.depositSize = fitDeposits(traders);
+  Object.assign(priors, fitDeposits(traders));
   Object.assign(priors, fitOutcomeRates(traders));
   Object.assign(priors, fitPayout(traders));
   priors.meanIdleMinutes = fitIdle(traders, behaviorOptions);

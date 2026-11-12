@@ -50,7 +50,15 @@ The demo uses deterministic synthetic data. It does not connect to a venue, plac
 npm run twin:recovery
 ```
 
-Fits twin-0.2.0 (`docs/MODEL_CARD.md`) to a SYNTHETIC population with known parameters and prints a short summary. The full results go to `analysis/output/twin-recovery/`, which is gitignored. Recovery numbers stay in that local output.
+Fits twin-0.2.1 (`docs/MODEL_CARD.md`) to a SYNTHETIC population with known parameters and prints a short summary. The full results go to `analysis/output/twin-recovery/`, which is gitignored. Recovery numbers stay in that local output.
+
+## Check the simulator
+
+```bash
+npm run twin:simulation
+```
+
+Simulates a SYNTHETIC population with `simulateTwinV2` (`docs/MODEL_CARD.md`, ADR-012), on the generator's true parameters and on fitted twins, and checks how often each trader's training behavior falls inside its simulated band. The full results go to `analysis/output/twin-simulation/`, which is gitignored. Calibration numbers stay in that local output.
 
 ## Run the web application
 

@@ -1,6 +1,7 @@
 /**
  * Small, dependency-free statistics helpers for the twin estimator
- * (estimate.mjs) and its recovery checks. Pure functions.
+ * (estimate.mjs), the simulator (simulate.mjs), and their checks. Pure
+ * functions; the samplers take a seeded generator from rng.mjs and use only it.
  *
  * Special functions follow standard published algorithms: the Lanczos
  * approximation for log-gamma, asymptotic series with recurrence for digamma
@@ -214,4 +215,40 @@ export function gammaQuantile(p, shape) {
   let high = Math.max(1, shape);
   while (gammaCdf(high, shape) < p) high *= 2;
   return bisect((x) => gammaCdf(x, shape), p, 0, high);
+}
+
+// --- Seeded samplers ---------------------------------------------------------------
+
+/**
+ * One draw from Gamma(shape, rate 1), using only `rng` (createRng in rng.mjs), so the
+ * same generator state gives the same draw. Marsaglia and Tsang (2000) for shape >= 1;
+ * for shape < 1, Gamma(shape) = Gamma(shape + 1) x U^(1 / shape). Always positive.
+ */
+export function gammaSample(rng, shape) {
+  if (!(Number.isFinite(shape) && shape > 0)) throw new RangeError('gammaSample: shape must be a positive number');
+  if (shape < 1) {
+    const u = Math.max(rng.next(), Number.EPSILON);
+    return Math.max(gammaSample(rng, shape + 1) * u ** (1 / shape), Number.MIN_VALUE);
+  }
+  const d = shape - 1 / 3;
+  const c = 1 / Math.sqrt(9 * d);
+  for (;;) {
+    let x;
+    let v;
+    do {
+      x = rng.normal();
+      v = 1 + c * x;
+    } while (v <= 0);
+    v = v * v * v;
+    const u = Math.max(rng.next(), Number.EPSILON);
+    if (u < 1 - 0.0331 * x ** 4 || Math.log(u) < 0.5 * x * x + d * (1 - v + Math.log(v))) return d * v;
+  }
+}
+
+// One draw from Beta(a, b) as X / (X + Y), with X ~ Gamma(a) and Y ~ Gamma(b) drawn in that order.
+export function betaSample(rng, a, b) {
+  if (!(Number.isFinite(a) && a > 0 && Number.isFinite(b) && b > 0)) throw new RangeError('betaSample: a and b must be positive numbers');
+  const x = gammaSample(rng, a);
+  const y = gammaSample(rng, b);
+  return x / (x + y);
 }
