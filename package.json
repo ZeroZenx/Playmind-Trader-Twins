@@ -11,7 +11,7 @@
     "demo": "node demo/run.mjs",
     "test": "node --test",
     "verify:release": "node scripts/verify-release.mjs",
-    "check": "node --check scripts/verify-release.mjs && node --check demo/run.mjs && node --check src/engine/index.mjs && node --check src/engine/rng.mjs && node --check src/engine/validate.mjs && node --check src/engine/signals.mjs && node --check src/engine/behavior.mjs && node --check src/engine/twin.mjs && node --check src/engine/policy.mjs && node --check src/engine/report.mjs && node --check src/synthetic/generate.mjs"
+    "check": "node --check scripts/verify-release.mjs && node --check demo/run.mjs && node --check src/engine/index.mjs && node --check src/engine/rng.mjs && node --check src/engine/validate.mjs && node --check src/engine/signals.mjs && node --check src/engine/behavior.mjs && node --check src/engine/twin.mjs && node --check src/engine/policy.mjs && node --check src/engine/report.mjs && node --check src/synthetic/generate.mjs && node --check src/synthetic/behavioral-generate.mjs && node --check src/synthetic/behavioral-write.mjs"
   },
   "engines": {
     "node": ">=20"
