@@ -273,5 +273,5 @@ Consequences:
 - Results on CUSTOMER data are customer-derived and stay out of the repo, like the fit.
 - The validation doesn't test churn, drift between the training and test periods beyond what the data shows, or responses to policies (there is no intervention data).
 - Cuts differ by trader, so one trader's training period can overlap another's test period in calendar time. Shocks common to all traders, such as a market-wide event, are not held out.
-- Training ends at a session boundary. A refuel deposit that would open the first test session within `refuelWindowMinutes` of the last training trade is not in the training data.
+- Training ends at a session boundary. A refuel deposit that would open the first test session within `refuelWindowMinutes` of the last training trade is not in the training data. This can't happen on the synthetic generator's data, whose minimum idle time exceeds the refuel window; on real data it can. A fix would need a per-trader observation end in `estimateTwins`, which takes one for the whole dataset.
 - Prompt 7's report reads `summary` (pass/fail, "beats", findings) and `metrics` (quantile bands, D, calibration, point errors).
