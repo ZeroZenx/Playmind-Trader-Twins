@@ -275,3 +275,25 @@ Consequences:
 - Cuts differ by trader, so one trader's training period can overlap another's test period in calendar time. Shocks common to all traders, such as a market-wide event, are not held out.
 - Training ends at a session boundary. A refuel deposit that would open the first test session within `refuelWindowMinutes` of the last training trade is not in the training data. This can't happen on the synthetic generator's data, whose minimum idle time exceeds the refuel window; on real data it can. A fix would need a per-trader observation end in `estimateTwins`, which takes one for the whole dataset.
 - Prompt 7's report reads `summary` (pass/fail, "beats", findings) and `metrics` (quantile bands, D, calibration, point errors).
+
+## ADR-015: Evidence report v2 (report-0.2.0)
+
+Decision: `buildReportV2` in `src/engine/report-v2.mjs` builds one JSON report from one dataset, its twin fit, its held-out validation, and one policy sweep. `renderReportV2Html` renders that JSON, and only that JSON, as one self-contained HTML page. The six sections come in a fixed order: data and fields, population behavior, twin validation, policy trade-off, which traders are most affected, and assumptions and limits. `npm run demo` builds it from a SYNTHETIC behavioral population (`src/synthetic/report-demo.mjs`). The report-0.1.0 functions (`buildReport`, `renderHtmlReport`) are kept for comparison.
+
+1. **Report output is local only.** The validation section contains held-out evaluation results: calibration coverage, KS distances, point errors, and pass/fail. CLAUDE.md keeps model evaluation metrics in gitignored local output. So `demo/output/` is now gitignored, and the old report-0.1.0 demo files are no longer tracked. A report built from CUSTOMER data is customer-derived and stays out of the repo, like the fit.
+2. **No trader token.** Neither the JSON nor the HTML contains a trader token. Section 5 groups traders by archetype (SYNTHETIC only, when there are at least two) or by parameter range:
+   - Chase coefficient: below 0.8, 0.8 to 1.25, and 1.25 or more. The 1.25 edge is the chase-episode line.
+   - Stop pattern: down_large ÷ flat stop hazard below 1.5, 1.5 to 3, and 3 or more.
+   A group with fewer than `minGroupSize` (5) traders is suppressed.
+3. **Statements come from the data.** The chase statement says "most traders scale back and a minority chase" only when the estimates show it. Otherwise it says the data's actual direction. It also counts the traders whose 90% interval is entirely above 1. The stop and refuel statements work the same way, and a proxied refuel trigger is named as proxied.
+4. **Section 5 uses one cell per policy.** That cell is the middle sweep setting with every response assumption at its default. Within each group, the report shows the median and the 10th to 90th percentile across traders of each trader's median harm reduction and activity retained. It also shows the group mean of each trader's mean paired change in net loss, and how many traders the policy reached. Many runs never trigger a policy, so median effects are often 0. When the largest group medians tie, the statement says no group stands out rather than naming one.
+5. **Charts.** All charts are inline SVG with a visible title and an accessible title and description. There are no scripts and no external resources. The trade-off chart has one panel per swept response assumption, one series per value of it, and a point per policy setting. Each point has 10th to 90th percentile bars on both axes. A reference line marks harm reduction = 1 − activity retained, where a policy that only cuts activity would sit.
+6. **No accuracy headline.** The report says "calibration coverage", "KS distance", and "point error", and states that validation is evidence about the model on this data, not an accuracy claim. A test checks that "accuracy" appears only in such denials and that no AUC or p-value appears.
+7. **Labels must agree.** The fit, holdout, and sweep must carry the same data label and model version, or the build throws. The banner and the plain-language assumptions change with the label.
+
+Reason: The report is what a design partner reads. It has to show what the data supports, how well the twin held up against simpler models, and what each policy result depends on, without exposing a trader or overstating a simulation.
+
+Consequences:
+
+- `npm run demo` now takes about a minute at its default scale. Flags scale it down.
+- The repo no longer carries a committed demo report. Anyone who wants to see one runs `npm run demo`.

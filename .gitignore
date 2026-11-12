@@ -13,10 +13,12 @@ __pycache__/
 data/
 *.parquet
 
-# CSV files are ignored everywhere except synthetic fixtures and demo output.
+# Demo output (npm run demo): report v2 holds held-out validation results, which stay local.
+demo/output/
+
+# CSV files are ignored everywhere except synthetic fixtures.
 *.csv
 !test/fixtures/**/*.csv
-!demo/**/*.csv
 
 # Environment files: only the example is tracked.
 .env

@@ -40,9 +40,11 @@ npm run demo
 
 ## Demo outputs
 
+`demo/output/` is gitignored, because report v2 contains held-out validation results.
+
 - `demo/output/synthetic-events.json`
-- `demo/output/synthetic-report.json`
-- `demo/output/synthetic-report.html`
+- `demo/output/report-v2.json`
+- `demo/output/report-v2.html`
 
 ## Production job states
 

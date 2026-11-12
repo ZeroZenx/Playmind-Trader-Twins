@@ -25,11 +25,13 @@ See `docs/IMPLEMENTATION_STATUS.md` for the evidence, remaining gates, and deplo
 npm run demo
 ```
 
-The command writes these files to `demo/output/`:
+The command builds evidence report v2 from a SYNTHETIC behavioral population. It generates the events, fits twins, runs held-out validation, runs a policy sweep, and writes the results. It takes about a minute; `npm run demo -- --traders 30 --holdout-replicates 10 --sweep-replicates 8` is quicker. It writes these files to `demo/output/`:
 
 - `synthetic-events.json`
-- `synthetic-report.json`
-- `synthetic-report.html`
+- `report-v2.json`
+- `report-v2.html` (self-contained, with inline SVG charts and no scripts)
+
+`demo/output/` is gitignored, because the report contains held-out validation results, which stay in local output.
 
 ## Run checks
 
