@@ -5,6 +5,7 @@ Two models and two simulators live in `src/engine/`:
 - **twin-0.2.1** (`estimate.mjs`): a behavioral twin per trader, a small set of interpretable parameters with uncertainty. twin-0.2.0 plus `latencySpread` and `depositSpread`, which the simulator needs.
 - **simulator-0.2.0** (`simulate.mjs`, `simulateTwinV2`): simulates twin-0.2.1 twins trade by trade, so a twin reacts to its own losses. Described under Simulation.
 - **policy-0.2.0** (`policy-sim.mjs`, `comparePolicyV2`, `runPolicySweep`): runs responsible-trading policies on simulator-0.2.0, with every trader response a named, swept assumption. Described under Policy simulation.
+- **holdout-0.1.0** (`holdout.mjs`, `runHoldoutValidation`): held-out validation. It fits twins on each trader's earlier data, simulates the later period, and compares the result with what happened, against baseline-0.1 and a naive model. Described under Held-out validation.
 - **Transparent behavioral baseline** (`twin.mjs`, model version 0.1.0, reported as baseline-0.1): aggregate summaries and a seeded simulator whose stakes don't depend on outcomes. It is kept for comparison and described at the end.
 
 ## Intended use
@@ -89,7 +90,7 @@ Without balance fields, `refuelProbability` is not estimable and `stopHazard` is
 
 ### Validation
 
-Recovery on SYNTHETIC traders with known parameters (`test/twin-recovery.test.mjs`, `npm run twin:recovery`) checks that estimates track the truth, that 90% intervals cover the truth about as often as they should, that short histories are pulled toward the prior, and that missing inputs give not-estimable parameters. The results are written only to gitignored local output. Synthetic recovery shows the estimator works when the model is right. It says nothing about whether real traders behave like the model. Held-out validation on later data is Prompt 6.
+Recovery on SYNTHETIC traders with known parameters (`test/twin-recovery.test.mjs`, `npm run twin:recovery`) checks that estimates track the truth, that 90% intervals cover the truth about as often as they should, that short histories are pulled toward the prior, and that missing inputs give not-estimable parameters. The results are written only to gitignored local output. Synthetic recovery shows the estimator works when the model is right. It says nothing about whether real traders behave like the model. Held-out validation on later data is described under Held-out validation.
 
 ### Limitations
 
@@ -135,7 +136,7 @@ Per run, the harm metrics are the deepest session drawdown (in currency and in b
 
 ### Validation
 
-`test/simulate.test.mjs` checks determinism, common random numbers, exact behavior with point-mass parameters, wider bands with uncertainty (wider still for short histories), archetype directions, and the not-simulable and no-balance paths. `test/simulation-calibration.test.mjs` and `npm run twin:simulation` simulate SYNTHETIC traders for their training session counts, on the generator's true parameters and on fitted twins, and count how often each trader's observed training value falls inside its simulated band. The results stay in test thresholds and gitignored local output. The fitted check is in-sample. Held-out validation is Prompt 6.
+`test/simulate.test.mjs` checks determinism, common random numbers, exact behavior with point-mass parameters, wider bands with uncertainty (wider still for short histories), archetype directions, and the not-simulable and no-balance paths. `test/simulation-calibration.test.mjs` and `npm run twin:simulation` simulate SYNTHETIC traders for their training session counts, on the generator's true parameters and on fitted twins, and count how often each trader's observed training value falls inside its simulated band. The results stay in test thresholds and gitignored local output. The fitted check is in-sample. The out-of-sample check is described under Held-out validation.
 
 ### Limitations
 
@@ -220,8 +221,55 @@ A sweep adds, for each policy, a chart (one series per value of each swept assum
 - Without balance fields, stopping is all-cause and double-counted in low-balance states, and policies that act on low balances inherit that. Without a money model, a deposit limit is not applicable.
 - Policy results from a CUSTOMER fit are customer-derived data and stay out of the repo.
 
+## Held-out validation (holdout-0.1.0)
+
+`runHoldoutValidation(events, options)` in `src/engine/holdout.mjs` asks whether a twin fitted on a trader's earlier data predicts how that trader behaves later, and whether it does so better than simpler models. ADR-014 in `docs/DECISIONS.md` gives the reasons for each choice. The results are evidence about a model on stated data. They are not an accuracy headline and not a causal claim, and their numbers stay in test thresholds and gitignored local output.
+
+### Inputs
+
+- Events in the analytical event schema, and a data label: SYNTHETIC, OBSERVATIONAL, or CUSTOMER. Balance fields and market fields are optional, as everywhere else.
+- `behaviorOptions` (session gap, refuel window, bucket edges), the split settings, the seed, and the replicate count.
+- On SYNTHETIC data only, a truth reference: twins on the generator's known parameters (`truth-twins.mjs`).
+- `npm run twin:holdout` runs it on a SYNTHETIC behavioral population twice. The first run has balance fields. The second has none, so stops are all-cause and refuel is the losing-streak proxy, which is the path closest to what we expect from Sporttrade. Results go to gitignored `analysis/output/twin-holdout/`, and the script prints a short summary and its runtime.
+- `runObservationalHoldout` is the entry point for public data under the OBSERVATIONAL label. Loading the Polymarket data into the event schema is not wired yet.
+
+### Method
+
+Each trader's history is split by time, never at random. The active period runs from the trader's first to last trade, deposit, or withdrawal. The cut is the start of the first session that begins at or after 75% of the way through that period, so no session is split. Everything before the cut is training data and everything from the cut on is test data. Because the period ends at the trader's last event, every trader is active through their whole test window. The twin is therefore not tested on churn, that is, on whether a trader stops coming back. A trader with too few training sessions, test sessions, test trades, or test days gets no result, only a reason.
+
+The twins are fitted once, with `estimateTwins` on every trader's training data. Each trader is then simulated from their cut for the length of their test window, starting from their last observed balance. Three models are simulated: the twin with its parameter uncertainty, the old baseline-0.1 simulator, and, on synthetic data, twins on the true parameters with uncertainty off. baseline-0.1 has its own event shape and a fixed start date, so an adapter maps its events to the event schema and shifts them to the trader's cut. The fourth model, the naive model, simply repeats each trader's training values without reacting to the last outcome. For stake after a loss and after a win, it predicts the trader's overall training stake for both.
+
+Every side goes through the same event-level definitions: the observed test data, the naive model's training data, and every simulated run. Every stake is scaled by the twin fit's base stake, on every side. Only quantities real data shows are compared. Forced stops and the reason a session ended are simulator decisions, so they are left out.
+
+The compared quantities are:
+
+- stake after a loss and stake after a win, each relative to the base stake, and their difference;
+- session length in trades and in minutes;
+- the time between trades within a session;
+- deposits within the refuel window after a loss;
+- idle time between sessions, as a diagnostic only.
+
+For each quantity the validation reports three things:
+
+- **Distribution.** The observed 10th, 25th, 50th, 75th, and 90th percentiles of the pooled test data, each against a band from the simulated replicates. The distance between the observed and simulated distributions is the two-sample Kolmogorov-Smirnov statistic D. No p-value is reported, because the simulated sample pools many replicates.
+- **Calibration.** The share of traders whose observed test value falls inside their own simulated 10th-90th percentile band.
+- **Point error.** Each model's median absolute error per trader. A simulated model's point is its median across replicates; the naive model's is its training value.
+
+The twin beats a comparator on a quantity when it has both the smaller point error and the smaller D. Overall, it beats the comparator when it wins on a majority of the quantities. The twin earns a claim only when it beats both baseline-0.1 and the naive model. Pass/fail tolerances for calibration and D are fixed in the module and can be overridden. Any quantity where the twin loses is listed as a finding.
+
+### Limitations
+
+- **Churn.** Not tested: every trader is active through their test window by construction.
+- **Common shocks.** Cuts differ by trader, so one trader's training period can overlap another's test period in time. Shocks common to all traders are not held out.
+- **Short histories.** These traders are excluded rather than validated. A test window of less than a day is excluded too, because the simulator starts its first session at a random time within a day of its start.
+- **Stationary synthetic data.** The synthetic population doesn't change over time. That makes repeating the training values a strong baseline, and it says nothing about drift in real data.
+- **Known shape differences.** On synthetic data, the simulator's idle time between sessions has a different shape from the generator's, and deposits after a loss differ with it. These mismatches are expected even with true parameters, and they are reported rather than tuned away.
+- **Real data.** Without balance fields, stopping is all-cause and refuel is a proxy, as in the simulator.
+- **Policies.** Held-out validation checks behavior without policies. It says nothing about how traders respond to a policy, for which there is no data.
+- **Customer data.** Results on CUSTOMER data are customer-derived and stay out of the repo.
+
 ## Transparent behavioral baseline (baseline-0.1)
 
-The baseline represents selected aggregate behavior from tokenized trader activity: session activity, trade frequency, stake distribution, deposit behavior, market mix, and response to configured policy friction. Its stakes don't depend on outcomes, so it can't react to losses or to a policy. `simulateTwin` is unchanged and kept for comparison; `simulateBaseline` runs it with its output labelled baseline-0.1.
+The baseline represents selected aggregate behavior from tokenized trader activity: session activity, trade frequency, stake distribution, deposit behavior, market mix, and response to configured policy friction. Its stakes don't depend on outcomes, so it can't react to losses or to a policy. `simulateTwin` is unchanged and kept for comparison; `simulateBaseline` runs it with its output labelled baseline-0.1. Held-out validation compares it with the twin through an adapter.
 
-Limitations: missing outcomes reduce coverage, small samples produce unstable estimates, and its synthetic replay compares simulated totals with the same window the profile was built from, which is a mechanics check, not validation.
+Limitations: missing outcomes reduce coverage, small samples produce unstable estimates. `validateTwin` compares simulated totals with the same window the profile was built from. It is labelled a same-window mechanics check, not validation.

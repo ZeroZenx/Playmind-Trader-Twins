@@ -136,7 +136,7 @@ Consequences:
 
 - Simulated runs from a CUSTOMER fit are customer-derived data and stay out of the repo, like the fit.
 - Bands carry parameter uncertainty only as far as the marginal posteriors do; correlated uncertainty (stop propensity, base stake with dispersion) is not represented.
-- The calibration check shows the simulator implements the model on SYNTHETIC data. Whether the model fits real traders is Prompt 6's held-out validation.
+- The calibration check shows the simulator implements the model on SYNTHETIC data. Whether the model predicts traders' later behavior is the held-out validation (ADR-014).
 - Prompt 5 adds policies through the hook and must keep each policy's effects to the decisions it changes, so common random numbers still hold.
 
 ## ADR-013: Policies with explicit response assumptions (policy-0.2.0)
@@ -209,3 +209,69 @@ Consequences:
 - One-at-a-time sweeps miss interactions between assumptions (for example, reset with a rebound). Use the grid design to see them.
 - The default sweep is (51 cells + 1 baseline) × traders × replicates runs. Its runtime is printed by `npm run policy:sweep`, and the script takes flags to scale it down.
 - Prompt 7's chart reads `policies[].chart` and the per-trader rows. Groupings are by archetype or parameter range (each trader's estimates are in `traders`), never by individual token in a summary.
+
+## ADR-014: Held-out validation (holdout-0.1.0)
+
+Decision: `runHoldoutValidation` in `src/engine/holdout.mjs` (version `holdout-0.1.0`) fits twins on each trader's earlier data, simulates the later period, and compares what each model simulates with what the trader then did. It compares the twin (twin-0.2.1 on simulator-0.2.0) with baseline-0.1 and a naive model, and on SYNTHETIC data with a truth reference. `validateTwin` stays as it was, labelled a same-window mechanics check: it compares simulated totals with the window the profile was built from, so it validates nothing. `npm run twin:holdout` runs the validation on a SYNTHETIC behavioral population, with and without balance fields, and writes to gitignored `analysis/output/twin-holdout/`. Results are evidence about a model on stated data. They are never an accuracy headline and never a causal claim, and their numbers stay in test thresholds and gitignored output. Method and limits are in `docs/MODEL_CARD.md`.
+
+1. **The split is time-based per trader, never random.** A trader's active period runs from their first to their last trade, deposit, or withdrawal. The cut is the start of the first session that starts at or after `trainShare` (default 0.75) of the way through that period. Sessions use the `sessionGapMinutes` rule, as everywhere else. The cut always lands on a session start, so no session is cut in half, and the last training event is more than the session gap before it. Events before the cut train; events at or after it test. A per-trader period, rather than one calendar date for everyone, gives every trader a test window whatever their dates.
+2. **Churn caveat.** The active period ends at the trader's last event, so every trader is active through their whole test window by construction. The twin is not tested on churn: whether a trader stops coming back is outside this validation. The output and the model card say so.
+3. **Too-small windows give null, never a number.** A trader needs at least `minTrainSessions` (2) training sessions, `minTestSessions` (3) test sessions, `minTestTrades` (10) test trades, and `minTestDays` (1) test days. Otherwise they get `eligible: false` and a reason, and no metric. The day minimum is there because the simulator starts its first session at a uniform time within 24 hours of its start, so a shorter window can't be simulated fairly. A trader the twin can't simulate, or with no estimated `baseStake`, is listed as not compared, with the reason. An ineligible trader's events before the cut, or every event when there is no cut, still go into the fit, so they inform the priors.
+4. **One fit, per-trader simulation.** `estimateTwins` runs once on every trader's training events, with the caller's data label and `behaviorOptions`. Each trader is then simulated on their own, from their cut, for their test window length in days, starting at their last observed training `balance_after` (`lastObservedBalances`). Without balance fields the starting balance is 0, with the session-start deposit rule. `simulateTwinV2` takes one start and one horizon for everyone, so the validation calls `prepareSimulation` and `simulateReplicate` per trader. Replicate seeds don't depend on which other traders are simulated (ADR-012 point 8), so this equals a batch run; a test checks it. Runs go replicate by replicate across traders. Each run's events are reduced to the metrics and dropped at once, so memory stays flat. `simulate.mjs` is unchanged.
+5. **Shared definitions.** Observed test events, training events, and every model's simulated events go through one function, `holdoutEventMetrics`, built on `buildBehaviorObservations` and `metricsFromEvents`. Every stake is divided by the training fit's estimated `baseStake` on every side. In-simulator metrics use each run's drawn `baseStake` and are never compared with event-derived values.
+6. **Observable only.** Only quantities real event data shows are compared. Forced stops, refuel deposits, and stop causes are simulator decisions. The calibration check (ADR-012 point 13) took them from the generator's truth file, which a validator for real data can't do.
+7. **Metrics** (`HOLDOUT_METRICS`). Each has a sample (one value per trade, session, or gap) and a per-trader statistic.
+   - Stake after a loss and stake after a win: the stake on the trade after a realized loss or win in any session, divided by the training `baseStake`. Per trader: the median.
+   - Their difference: the median after a loss minus the median after a win (signal 1's lossMinusWin), one value per trader.
+   - Trades per session: session length in trades. Per trader: the mean, `metricsFromEvents`' `tradesPerSession`. Session length in trades and trades per session are one quantity, so they are one metric.
+   - Session minutes: first to last event of each session with a trade. Per trader: the median.
+   - Within-session inter-trade time, in minutes. Per trader: the median.
+   - Deposits within `refuelWindowMinutes` after a realized loss, counted in the session each deposit falls in. Per trader: `metricsFromEvents`' `depositsAfterLossPerSession`.
+   - Idle minutes between sessions: a diagnostic. It is reported but not scored, so the session-timing shape is visible without deciding the verdict.
+   A missing realized outcome stays unavailable: the trade after it is in neither stake sample.
+8. **Quantiles, bands, and KS without p-values.** For each metric, the observed p10, p25, p50, p75, and p90 of the pooled test sample are compared with bands. A band is the 10th to 90th percentile, across replicates, of each replicate's pooled quantile. The two-sample KS statistic D compares the pooled observed sample with the pooled simulated sample of the first `ksReplicates` (50) replicates; the cap keeps memory bounded. The simulated sample pools many replicates, so it is far larger than any real one, and a p-value would be meaningless. We report D as a distance and read it against a tolerance. Ties are handled by stepping both empirical CDFs past every copy of a value before taking the difference. That is the exact supremum for step functions, so D is exact for discrete metrics. Its null distribution is not the continuous one, which is one more reason for no p-value.
+9. **Per-trader calibration.** A simulated model's point for a trader is the median of the trader's per-replicate statistic, and its band runs from the 10th to the 90th percentile. At least half the replicates must have a value. Calibration is the share of traders whose observed test statistic lies inside the band, with `simulation-calibration.mjs`'s rule (`bandCoverage`, slack 1e-9). The nominal share is 0.8. Count metrics (trades per session, deposits after a loss) have many ties and over-cover, so they are flagged and get their own tolerance, where only the floor binds.
+10. **The models.**
+    - twin: twin-0.2.1, fitted, uncertainty on.
+    - baseline-0.1: `simulateBaseline` on `buildTwins(buildSignals(training events))`, through an adapter (point 11).
+    - naive-0.1 (point 12).
+    - truth: SYNTHETIC only, the generator's true parameters as point masses (`truth-twins.mjs`), uncertainty off. It is the best this model shape can do, so it separates estimation error (the truth reference is within tolerance and the twin is not) from model misspecification (neither is). Each metric's `diagnosis` says which.
+11. **The baseline-0.1 adapter.**
+    - **Shape.** baseline-0.1 events have their own shape (`occurredAt`, `stakeAmount`, `realizedResult`, `amount`), a hard-coded start at 2026-01-01T12:00Z, sessions at fixed hours, and no balances. The adapter maps them to the analytical schema with a fresh `event_id`, the trader token, `venue_id` `simulated-baseline-0.1`, and `source_row_number`, and drops `marketType`.
+    - **Timing.** It shifts every event by (cut − that start), so the baseline's first session lands on the cut. It runs for max(1, test days) days, because its day offsets are `horizonDays` − 1 and a shorter horizon would place events before the cut.
+    - **Overlapping sessions.** Its sessions sit at fixed hours, so a long session can run into the next one, and the event data then sees one session. We keep what its events say.
+    - **Replicates** vary its seed: `stableSeed(seed:baseline-0.1:traderToken:replicate)`.
+12. **The naive model (naive-0.1).** It repeats each trader's training values, with no dependence on the last outcome.
+    - **Point prediction.** For each trader and metric, it is the same per-trader statistic computed on the trader's training events with the same definitions. Stake after a loss and stake after a win are both the median of every training stake divided by the training `baseStake`, and their difference is 0.
+    - **Distribution.** The pooled training samples, honestly defined: every training stake for both stake metrics, and a 0 per trader for the difference. It has no band, so it gets no calibration.
+    - **Why it matters.** On a stationary population, repeating the training values is a strong baseline for metrics that don't depend on the last outcome. A twin that only matches it adds nothing there.
+13. **"Beats".** On one metric, the twin beats a comparator when both of these hold:
+    - Its median absolute point error is below the comparator's × (1 − `errorMargin`). The error is computed on the paired set: traders with an observed value and a point from the twin, baseline-0.1, and naive-0.1.
+    - Its KS D is below the comparator's D − `dMargin`.
+    When only one of the two can be computed, that one decides. Overall, the twin beats a comparator when it beats it on more than `beatsShare` of the scored metrics they were compared on. **The twin earns a claim only if it beats both baseline-0.1 and naive-0.1.** When it doesn't beat one on some metric, that is reported as a finding (`summary.overall.findings`). The definitions and tolerances are not changed to make it pass.
+14. **Tolerances and pass/fail** (`HOLDOUT_TOLERANCES`, set before any result was seen).
+    - **Calibration** passes when coverage is within [0.65, 0.95] for continuous metrics, or within [0.65, 1] for tied ones.
+    - **Distribution** passes when D ≤ 0.1.
+    - **Margins**: `errorMargin` and `dMargin` are 0. `beatsShare` is 0.5, a strict majority.
+    - **A metric passes** when its calibration and distribution pass and the twin beats both comparators on it.
+    - **Overall pass** needs the claim, plus calibration and distribution passing on at least `passShare` (all) of the scored metrics.
+    - `summarizeHoldout(result, tolerances)` is pure, so pass/fail can be recomputed with other tolerances without simulating again.
+15. **Labels and provenance.** Every output carries:
+    - the data label (SYNTHETIC, OBSERVATIONAL, or CUSTOMER);
+    - the holdout, model, simulator, behavior, baseline, and naive versions;
+    - the seed and the replicate counts;
+    - the split rule and the churn caveat;
+    - the assumptions list.
+    Labels from the simulator are kept: all-cause stops and proxy refuel on the no-balance path, which is closest to what we expect from Sporttrade, and traders without a money model. On SYNTHETIC data, the known shape differences between the simulator and the generator (ADR-012 point 7) are attached to the metrics they affect. One is idle time between sessions. The other is deposits after a loss, which a short simulated idle time can add to. They are reported, not tuned away. A truth reference is refused for any other label.
+16. **The OBSERVATIONAL hook.** `runObservationalHoldout(events, options)` runs the validation with the OBSERVATIONAL label, on events already in the analytical schema, without a truth reference. Loading the Polymarket public data and mapping wallets to events is **not wired**. `OBSERVATIONAL_HOOK` says so, and `npm run twin:holdout -- --observational` stops with that note.
+
+Reason: The twin is only worth simulating policies on if it predicts a trader's later behavior better than simpler models. That has to be tested on data it wasn't fitted to, against baselines that are easy to beat for the wrong reasons (baseline-0.1) and hard to beat for the right ones (the naive model on a stationary population). Shared event-level definitions make the observed and simulated sides comparable. Keeping to observable quantities means the same validator runs on customer data. The truth reference tells a fitting problem from a model-shape problem.
+
+Consequences:
+
+- Validation numbers (coverage, D, errors, pass/fail counts) stay in test thresholds and gitignored output. They never appear in docs, the README, or commit messages.
+- Results on CUSTOMER data are customer-derived and stay out of the repo, like the fit.
+- The validation doesn't test churn, drift between the training and test periods beyond what the data shows, or responses to policies (there is no intervention data).
+- Cuts differ by trader, so one trader's training period can overlap another's test period in calendar time. Shocks common to all traders, such as a market-wide event, are not held out.
+- Training ends at a session boundary. A refuel deposit that would open the first test session within `refuelWindowMinutes` of the last training trade is not in the training data.
+- Prompt 7's report reads `summary` (pass/fail, "beats", findings) and `metrics` (quantile bands, D, calibration, point errors).

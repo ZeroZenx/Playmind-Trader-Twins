@@ -12,7 +12,7 @@
  *   continuous metric, and more for a count with ties.
  * - fitted: twins from estimateTwins on the same events, with uncertainty on. This is
  *   in-sample (the twins were fitted to the data they are compared with), so coverage
- *   runs high. Held-out validation is Prompt 6.
+ *   runs high. Held-out validation is holdout-validation.mjs (ADR-014).
  *
  * Calibration numbers belong only in test thresholds and the gitignored output the
  * script writes. Don't copy them into docs or commit messages. Pure: no I/O.

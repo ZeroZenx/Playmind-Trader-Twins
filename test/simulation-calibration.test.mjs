@@ -30,7 +30,7 @@ const TRUTH_CONTINUOUS_AVERAGE = [0.7, 0.9];
 // Per-session counts have many ties, which put more values inside the band.
 const TRUTH_COUNTS = [0.65, 1];
 // Fitted parameters, uncertainty on: in-sample, so over-coverage is expected. Only a lower
-// bound means anything here. Held-out validation is Prompt 6.
+// bound means anything here. Held-out validation is test/holdout-validation.test.mjs.
 const FITTED = [0.7, 1];
 
 const results = runSimulationCalibration();

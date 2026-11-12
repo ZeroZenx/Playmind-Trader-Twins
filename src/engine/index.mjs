@@ -63,4 +63,30 @@ export {
   validatePolicyV2,
   validateResponseAssumptions
 } from './policy-sim.mjs';
+// holdout-0.1.0: held-out validation against baseline-0.1 and naive-0.1 (ADR-014).
+export {
+  BASELINE_ADAPTER,
+  BASELINE_START,
+  CHURN_CAVEAT,
+  HOLDOUT_DEFAULTS,
+  HOLDOUT_METRICS,
+  HOLDOUT_METRIC_NAMES,
+  HOLDOUT_TOLERANCES,
+  HOLDOUT_VERSION,
+  NAIVE_DEFINITION,
+  NAIVE_MODEL_VERSION,
+  OBSERVATIONAL_HOOK,
+  SPLIT_RULE,
+  SYNTHETIC_SHAPE_DIFFERENCES,
+  bandCoverage,
+  baselineEventsToAnalytical,
+  holdoutEventMetrics,
+  holdoutQuantiles,
+  ksStatistic,
+  naivePrediction,
+  runHoldoutValidation,
+  runObservationalHoldout,
+  splitHoldout,
+  summarizeHoldout
+} from './holdout.mjs';
 export { buildReport, renderHtmlReport } from './report.mjs';

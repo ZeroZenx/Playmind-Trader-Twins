@@ -158,6 +158,11 @@ export function simulateTwin(twin, options = {}) {
   };
 }
 
+/**
+ * Same-window mechanics check, not validation: it compares baseline-0.1 simulated totals
+ * with the window the profile was built from. Held-out validation is runHoldoutValidation
+ * in holdout.mjs (ADR-014).
+ */
 export function validateTwin(twin, observedSignal, simulatedResult) {
   const comparisons = [
     ['tradeCount', observedSignal.tradeCount, simulatedResult.tradeCount],
@@ -172,7 +177,8 @@ export function validateTwin(twin, observedSignal, simulatedResult) {
   return {
     twinId: twin.twinId,
     status: 'synthetic-baseline-check',
+    checkType: 'same-window mechanics check (not validation)',
     comparisons,
-    note: 'Synthetic replay is a mechanics check. It is not proof of production model performance.'
+    note: 'Same-window mechanics check: the simulated totals are compared with the window the profile was built from, so this validates nothing. Held-out validation is runHoldoutValidation (holdout.mjs). It is not proof of production model performance.'
   };
 }
