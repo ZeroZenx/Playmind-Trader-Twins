@@ -1,14 +1,27 @@
+// Direct PII and raw account identifiers. This list must match the forbidden headers in
+// src/lib/ingestion.ts; test/intake-validate.test.mjs checks that they agree. Add to both,
+// never remove from either.
 const PROHIBITED_FIELDS = new Set([
   'name',
+  'full_name',
+  'first_name',
+  'last_name',
+  'username',
+  'user_name',
+  'customer_name',
   'email',
+  'email_address',
   'phone',
   'address',
   'date_of_birth',
   'dob',
   'government_id',
+  'ip',
   'ip_address',
   'device_fingerprint',
-  'unmasked_account_id'
+  'unmasked_account_id',
+  'account_id',
+  'customer_id'
 ]);
 
 const EVENT_TYPES = new Set([

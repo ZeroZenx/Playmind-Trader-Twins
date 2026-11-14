@@ -297,3 +297,35 @@ Consequences:
 
 - `npm run demo` now takes about a minute at its default scale. Flags scale it down.
 - The repo no longer carries a committed demo report. Anyone who wants to see one runs `npm run demo`.
+
+## ADR-016: Local intake for a raw venue export (intake-0.1.0)
+
+Decision: `npm run intake` (`scripts/intake.mjs`) takes a raw CSV, JSON, or JSON Lines export to analytical events and then to report v2, on the user's machine, with the commands `profile`, `map`, `validate`, `readiness`, `run`, and `fields`. The logic lives in `src/intake/` (`source`, `pii`, `values`, `profile`, `map`, `validate`, `readiness`, `pipeline`, `fixture`), each with its own version string, so the CLI and the tests run one code path. The steps for Sporttrade's file and the config reference are in `docs/SPORTTRADE_INTAKE.md`.
+
+1. **No raw values, ever.** No command prints or writes a raw identifier or a PII-looking value.
+   - Profile shows masked shapes (letters become `A`, digits `9`), lengths, character classes, types, null rates, counts, and the date range of unflagged timestamp columns. PII-flagged columns show no shapes.
+   - Drops and fixes are counts with reasons and at most five row numbers. Unknown type values are reported by shape.
+   - Errors name columns, fields, and rows, never cell contents.
+   - The one opt-in exception is `profile --categories`, so event-type codes can be read. It shows the distinct values of an unflagged column with at most 25 of them, each only if it occurs at least 5 times and has no 3-digit run or `@`.
+2. **Tokenization.** A raw trader ID becomes `tr_` plus the first 16 hex characters of HMAC-SHA256(salt, trimmed ID). A mapped source row ID becomes `ev_` plus 20 hex of HMAC-SHA256(salt, `event_id:` + ID). Without one, `event_id` is `row_<line>`. So no raw source identifier reaches `events.json` or anything after it. Two IDs whose tokens collide stop the run.
+3. **The salt.** It comes only from `PLAYMIND_TOKEN_SALT`, which `npm run intake` may load from a local `.env` (`--env-file-if-exists`). `.env.example` lists the name with an empty value. `map` and `run` refuse to start without it, or with fewer than 16 characters, and there is no default. The salt is never in a config, an output, or a message. One salt per customer keeps tokens stable across runs. Losing it breaks linkage to earlier runs, which is acceptable: nobody can reverse tokens without it either.
+4. **PII rules.**
+   - Direct PII is flagged by header: validate.mjs `PROHIBITED_FIELDS`, plus email, phone, address, birth date, government ID, IP, fingerprint, and person-name patterns, with camelCase and spaces normalized.
+   - It is also flagged by value shape: any email-shaped value, or a majority of phone-, IPv4-, or person-name-shaped values.
+   - A mapped column with a PII flag is rejected, even as the trader ID. A column whose header names an account or person may only be the trader ID column. Unmapped columns are dropped and listed by name.
+   - `account_id`, `customer_id`, and `unmasked_account_id` are prohibited in analytical events. In a raw source they are the ID to tokenize, so they are flagged as raw identifiers, not rejected.
+5. **One prohibited list.** `validate.mjs` `PROHIBITED_FIELDS` was tightened to the forbidden headers of `src/lib/ingestion.ts`. It gained `full_name`, `first_name`, `last_name`, `username`, `user_name`, `customer_name`, `email_address`, `ip`, `account_id`, and `customer_id`. Nothing was removed from either list, and `ingestion.ts` was not changed. `test/intake-validate.test.mjs` checks that the lists agree and that `parseTokenizedCsv` rejects every listed header. Intake also maps spaces to `_` (as `validate.mjs` does), so it rejects headers such as `Email Address` that `ingestion.ts` accepts.
+6. **Labels.** Every command needs `--label` (SYNTHETIC, OBSERVATIONAL, or CUSTOMER), and a label in the config must agree. Every output carries it: JSON files at the top level, `readiness.md` in its title, the report in its banner. A CUSTOMER run prints a reminder that its outputs are customer-derived. The fixtures are SYNTHETIC.
+7. **Where outputs go.** By default, `data/output/<run-name>/`, which is gitignored. A run name must be a plain name, so a default run can't write outside `data/`. Any other directory needs an explicit `--out`. A CUSTOMER run also refuses an input file, mapping config, or `--out` inside the repo but outside `data/`.
+8. **Readiness is derived, not restated.** `assessReadiness` reads `requires`, `anyOf`, `voluntaryNeeds`, `proxyFor`, and `fallback` from `BEHAVIOR_SIGNAL_DEFINITIONS` and `TWIN_PARAMETER_DEFINITIONS`. Two engine rules are stated in the module rather than taken from the tables: which event types each field is read on (the scopes report v2 uses), and that balance fields count only for traders with both of them on every trade. The field tiers in `docs/SPORTTRADE_INTAKE.md` come from `fieldAskList()`, and a test fails if the doc drifts.
+9. **Cleaning a raw dump.** These are handled and counted: blank rows, exact duplicate rows (after trimming), rows with extra non-empty cells, comment lines before the header, stray whitespace, null markers (`NULL`, `NaN`, `N/A`, `\N`, `None`), case and padding in type values, thousands separators, accounting parentheses, and currency symbols. Missing realized results stay null, never 0. Timestamps without an offset are read in the configured time zone and written as UTC ISO.
+10. **Fixtures.** `scripts/build-intake-fixtures.mjs` builds `test/fixtures/intake/ledger-export.csv` from the behavioral generator: 24 traders, no balances, some missing results, cents, UTC, a raw account ID column, and dump artifacts. `ledger-export-pii.csv` is deliberately bad. A test rebuilds both and compares them with the committed files.
+
+Reason: Sporttrade's export will be a raw dump with unknown columns and no market detail. The first look at it must not leak an identifier. The mapping must state its assumptions (units, time zone, signs) instead of guessing them. The ask list we send back must follow from what the model actually needs.
+
+Consequences:
+
+- The mapping config for a real export holds real column names and type codes, so it is customer data and lives under `data/`.
+- Exact-duplicate removal assumes identical rows are export artifacts. A source without a row ID, where identical rows can be real, needs `dropExactDuplicates: false`.
+- Value-shape PII detection is heuristic. A PII column with unusual formatting can pass the value checks. The header rules and a human review of the mapping are the other guards.
+- Event types mapped to `restriction_event` or `self_exclusion_event` are carried through, but no signal or parameter reads them yet.

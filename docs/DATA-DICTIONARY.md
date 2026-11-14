@@ -109,12 +109,18 @@ Every signal also needs `trader_token`, `occurred_at`, and the event type. The e
 
 ## Prohibited analytical fields
 
-- Name
-- Email
-- Phone
-- Address
-- Date of birth
-- Government ID
-- IP address
-- Device fingerprint
-- Unmasked account ID
+These names are rejected in analytical events by `validateEvents` (`PROHIBITED_FIELDS` in `src/engine/validate.mjs`) and by the upload path (`src/lib/ingestion.ts`). The two lists agree, and a test checks it.
+
+- Name: `name`, `full_name`, `first_name`, `last_name`, `username`, `user_name`, `customer_name`
+- Email: `email`, `email_address`
+- Phone: `phone`
+- Address: `address`
+- Date of birth: `date_of_birth`, `dob`
+- Government ID: `government_id`
+- IP address: `ip`, `ip_address`
+- Device fingerprint: `device_fingerprint`
+- Raw account IDs: `account_id`, `customer_id`, `unmasked_account_id`
+
+## Intake mapping
+
+A raw venue export becomes events in this schema through `npm run intake` (`scripts/intake.mjs`, `src/intake/`). Its mapping config states the source column for each field, the event-type mapping, the units of every amount, the time zone of the timestamps, sign conventions, and how trader IDs are tokenized (HMAC-SHA256 under `PLAYMIND_TOKEN_SALT`). The steps, the config reference, and the fields we ask a venue for are in `docs/SPORTTRADE_INTAKE.md`. The decisions are in ADR-016.
