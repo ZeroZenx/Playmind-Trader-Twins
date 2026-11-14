@@ -11,13 +11,20 @@ The file is CUSTOMER data. It, the mapping config written for it, and every outp
    ```
    PLAYMIND_TOKEN_SALT=<at least 16 random characters>
    ```
-   `npm run intake` loads `.env` if there is one. Without the salt, `map` and `run` refuse to start. There is no default. Keep the same salt for every run on Sporttrade data, or the tokens won't line up across runs. Store it the way we store other secrets, never in the repo, a ticket, or a chat.
+   or set it in the shell for the session (`npm run intake` then prints `.env not found. Continuing without it.`, which is expected):
+   ```
+   # bash
+   export PLAYMIND_TOKEN_SALT='<the salt>'
+   # PowerShell
+   $env:PLAYMIND_TOKEN_SALT = '<the salt>'
+   ```
+   `npm run intake` loads `.env` if there is one; a value already set in the shell wins. Without the salt, `map` and `run` refuse to start. There is no default. Keep the same salt for every run on Sporttrade data, or the tokens won't line up across runs. Store it the way we store other secrets, never in the repo, a ticket, or a chat.
 3. **Profile first.**
    ```
-   npm run intake -- profile data/sporttrade/raw/export.csv --label CUSTOMER --categories
+   npm run intake -- profile data/sporttrade/raw/export.csv --label CUSTOMER --categories --name sporttrade-v1
    ```
-   This prints and writes (to `data/output/profile-export/profile.json`) the columns, inferred types, null rates, row count, date range, masked value shapes (`AAAA-99999999`), lengths, character classes, blank and duplicate rows, and flags for columns that look like PII or raw identifiers. It never prints a raw value. `--categories` shows the distinct values of low-cardinality, unflagged columns (for example event-type codes) when each value occurs at least 5 times and has no digit run or `@`.
-4. **Write the mapping config under `data/`**, for example `data/sporttrade/mapping.json`. Start from `test/fixtures/intake/ledger-mapping.json`. The reference is below. Use the profile to pick the columns, the units (whole numbers usually mean cents), and the type values.
+   This prints and writes (to `data/output/sporttrade-v1/profile.json`; without `--name`, to `data/output/profile-export/`) the columns, inferred types, null rates, row count, date range, masked value shapes (`AAAA-99999999`), lengths, character classes, blank and duplicate rows, and flags for columns that look like PII or raw identifiers. It never prints a raw value. `--categories` shows the distinct values of low-cardinality, unflagged columns (for example event-type codes) when each value occurs at least 5 times and has no digit run or `@`.
+4. **Write the mapping config under `data/`**, for example `data/sporttrade/mapping.json`. Start from a copy of `test/fixtures/intake/ledger-mapping.json`, and change three keys before anything else: `"name": "sporttrade-v1"`, `"label": "CUSTOMER"`, and `"input": "raw/export.csv"` (`input` is read relative to the config file). A copy that still says `SYNTHETIC` or points at the fixture's file name stops with a message saying which. The reference is below. Use the profile to pick the columns, the units (whole numbers usually mean cents), and the type values.
 5. **Map, then validate and check readiness.**
    ```
    npm run intake -- map --config data/sporttrade/mapping.json --label CUSTOMER --name sporttrade-v1
@@ -27,15 +34,22 @@ The file is CUSTOMER data. It, the mapping config written for it, and every outp
    `map` writes `events.json` (tokenized) and `map-report.json`: every row dropped or fixed, by reason and count, never by content, plus the unmapped columns by name. `validate` runs the engine's `validateEvents` and the PII-header rule. `readiness` writes `readiness.json` and `readiness.md`: which signals and parameters are estimable, which are not and why, which fields would unlock each, field coverage, and how many traders have enough history for held-out validation. That file is the ask list for Sporttrade.
 6. **Run end to end.** A quick look first, then the full run:
    ```
-   npm run intake -- run --config data/sporttrade/mapping.json --label CUSTOMER --name sporttrade-v1 --traders 200 --holdout-replicates 10 --sweep-replicates 8 --policies stake_limit,cooldown
+   npm run intake -- run --config data/sporttrade/mapping.json --label CUSTOMER --name sporttrade-v1-quick --traders 200 --holdout-replicates 10 --sweep-replicates 8 --policies stake_limit,cooldown
    npm run intake -- run --config data/sporttrade/mapping.json --label CUSTOMER --name sporttrade-v1
    ```
-   `run` goes profile, map, validate, readiness, fit (`estimateTwins`), held-out validation (`runHoldoutValidation`), policy sweep (`runPolicySweep`), and report v2. It writes everything to `data/output/<name>/` and prints a short summary and the runtime. It stops after validation if the mapped events are invalid.
+   The quick look gets its own name, so its 200-trader `events.json` doesn't replace the one from step 5. `run` goes profile, map, validate, readiness, fit (`estimateTwins`), held-out validation (`runHoldoutValidation`), policy sweep (`runPolicySweep`), and report v2. It writes everything to `data/output/<name>/`, prints each step as it starts (to stderr, with the elapsed time), and ends with a short summary and the runtime. It stops after validation if the mapped events are invalid.
+
+   **Scale.** In the Prompt 9 dry run, a SYNTHETIC ledger of about 700,000 rows and 2,000 traders with no balances took about half an hour for the full run on a 10-core laptop, and peaked at about 3 GB of memory. The policy sweep took most of that time and the held-out validation most of the rest; profile through fit took about a minute. On a larger file, check the quick look's runtime first, and raise Node's heap before the full run (`export NODE_OPTIONS=--max-old-space-size=8192` in bash, `$env:NODE_OPTIONS = '--max-old-space-size=8192'` in PowerShell). Without that, Node stops at its default heap limit, about 4 GB on that laptop. `events.json` is large (about 300 bytes per event).
 7. **Before sharing anything**, read the report as a customer-derived document: it is confidential, it carries the CUSTOMER banner, and it shares only under the customer agreement. No number from it goes into the repo, a commit message, or the README.
 
-On the synthetic fixture, the whole sequence is:
+On the synthetic fixture, set a throwaway salt in the shell (never in a file), then run the whole sequence. It writes to `data/output/fixture-ledger/`:
 ```
-PLAYMIND_TOKEN_SALT=fixture-only-salt-000 npm run intake -- run --config test/fixtures/intake/ledger-mapping.json --label SYNTHETIC
+# bash
+export PLAYMIND_TOKEN_SALT="$(node -e "process.stdout.write(require('crypto').randomBytes(24).toString('base64url'))")"
+# PowerShell
+$env:PLAYMIND_TOKEN_SALT = node -e "process.stdout.write(require('crypto').randomBytes(24).toString('base64url'))"
+
+npm run intake -- run --config test/fixtures/intake/ledger-mapping.json --label SYNTHETIC
 ```
 
 ## Fields we need

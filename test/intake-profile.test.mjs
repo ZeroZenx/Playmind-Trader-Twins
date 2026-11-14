@@ -128,3 +128,15 @@ test('header and value rules', () => {
   assert.equal(maskValue('AC-4021-xy'), 'AA-9999-AA');
   assert.equal(maskValue('x'.repeat(40)), `${'A'.repeat(32)}…(40 chars)`);
 });
+
+test('profile handles a column larger than the call stack allows to spread (Prompt 9 scale run)', () => {
+  // The 2,000-trader dry run (700k rows) overflowed the stack in Math.min(...lengths). 300k
+  // values is past what one spread call takes on default Node settings.
+  const rows = 300000;
+  const lines = ['code,amount'];
+  for (let index = 0; index < rows; index += 1) lines.push(`${index % 7 === 0 ? 'AB' : 'ABCD'},${index % 1000}`);
+  const profile = profileSource(parseSource(lines.join('\n'), { fileName: 'large.csv' }), { label: 'SYNTHETIC', sourceName: 'large.csv' });
+  assert.equal(profile.rowCount, rows);
+  assert.deepEqual(profile.columns[0].length, { min: 2, max: 4 });
+  assert.deepEqual(profile.columns[1].length, { min: 1, max: 3 });
+});

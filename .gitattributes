@@ -1,0 +1,3 @@
+# SYNTHETIC test fixtures are compared byte for byte with a fresh build and hashed on upload.
+# Keep them LF on every platform, whatever core.autocrlf says.
+test/fixtures/** text eol=lf

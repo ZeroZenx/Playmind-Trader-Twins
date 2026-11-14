@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync, spawnSync } from 'node:child_process';
 import { existsSync } from 'node:fs';
-import { mkdtemp, readdir, readFile, rm, stat } from 'node:fs/promises';
+import { mkdtemp, readdir, readFile, rm, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -146,6 +146,37 @@ test('labels: --label is required, must match the config, and CUSTOMER prints th
   // anything is read or written.
   assert.match(mismatch.stderr, /mapping config is inside the repo but outside data\//);
   assert.match(CUSTOMER_REMINDER, /Keep it under data\//);
+});
+
+test('a config copied from the fixture fails early, with a message that says what to edit', async () => {
+  // Prompt 9 dry run: a copied config still says SYNTHETIC and points at the fixture's file name.
+  const directory = await mkdtemp(join(tmpdir(), 'playmind-intake-copied-'));
+  try {
+    const copied = join(directory, 'mapping.json');
+    await writeFile(copied, await readFile(configPath, 'utf8'));
+    // The label mismatch is caught before the (missing) input is read.
+    const label = cli(['map', '--config', copied, '--label', 'OBSERVATIONAL', '--out', join(directory, 'out')]);
+    assert.equal(label.status, 1);
+    assert.match(label.stderr, /mapping config says "label": "SYNTHETIC" but --label is OBSERVATIONAL/);
+    // The relative input is resolved next to the config, and the message says so.
+    const input = cli(['map', '--config', copied, '--label', 'SYNTHETIC', '--out', join(directory, 'out')]);
+    assert.equal(input.status, 1);
+    assert.match(input.stderr, /"input" is read relative to the config file; fix it or pass --input FILE/);
+    assert.ok(!existsSync(join(directory, 'out')), 'nothing written');
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test('run names the output folder, and the mapping config when the two differ', async () => {
+  const out = await mkdtemp(join(tmpdir(), 'playmind-intake-name-'));
+  try {
+    const result = cli(['run', '--config', configPath, '--label', 'SYNTHETIC', '--out', out, '--name', 'renamed-run', '--traders', '4', ...SMALL]);
+    assert.equal(result.status, 0, result.stderr);
+    assert.match(result.stdout, /\[SYNTHETIC\] run renamed-run \(mapping config "fixture-ledger"\): complete/);
+  } finally {
+    await rm(out, { recursive: true, force: true });
+  }
 });
 
 test('small or short histories: holdout finds few eligible traders and the report still renders', () => {

@@ -172,7 +172,9 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--data-dir", type=Path, default=Path(".data/polymarket"))
     parser.add_argument("--output-dir", type=Path, default=Path("analysis/output"))
-    parser.add_argument("--report", type=Path, default=Path("analysis/reports/polymarket-holdout-model.md"))
+    # The generated report holds holdout metrics, so it goes to gitignored local output (CLAUDE.md).
+    # analysis/reports/polymarket-holdout-model.md is the committed, metric-free description.
+    parser.add_argument("--report", type=Path, default=Path("analysis/output/polymarket-holdout-model.md"))
     args = parser.parse_args()
     retail = read_retail(args.output_dir)
     train = read_in_sample_episodes(args.output_dir, retail)

@@ -4,9 +4,9 @@
  * Runs the engine's validateEvents on mapped events, plus the PII-header rejection: no key of
  * any event may be a prohibited field. The prohibited list is validate.mjs's
  * PROHIBITED_FIELDS, which test/intake-validate.test.mjs checks against the forbidden headers
- * in src/lib/ingestion.ts, so the CLI and the upload path reject the same headers. Keys are
- * normalized both ways those files do it (validate.mjs: trim, lowercase, whitespace to "_";
- * ingestion.ts: trim, lowercase).
+ * in src/lib/ingestion.ts, so the CLI and the upload path reject the same headers. Both files
+ * normalize a header the same way (trim, lowercase, whitespace to "_"); intake also splits
+ * camelCase and maps punctuation to "_" (pii.mjs), so it rejects a superset.
  *
  * Messages carry row numbers and field names, never values. Pure: no I/O.
  */

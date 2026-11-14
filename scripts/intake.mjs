@@ -89,11 +89,26 @@ function readSalt() {
   return checkSalt(process.env[SALT_ENV_VAR]);
 }
 
+// Loads the mapping config, then checks its location and label before any source file is read.
+async function configFor(options, label) {
+  const loaded = await loadMappingConfig(options.config);
+  checkCustomerLocation(loaded.path, 'mapping config', { label });
+  if (loaded.config.label && loaded.config.label !== label) {
+    throw new IntakeError(`The mapping config says "label": "${loaded.config.label}" but --label is ${label}. Fix one of them (a config copied from the fixture still says SYNTHETIC).`);
+  }
+  return loaded;
+}
+
 async function sourceFor(options, config, label) {
   const inputPath = options.input ? resolve(options.input) : config.inputPath;
   if (!inputPath) throw new IntakeError('No input file: pass --input or set "input" in the mapping config.');
   checkCustomerLocation(inputPath, 'input file', { label });
-  return { inputPath, text: await readSourceFile(inputPath) };
+  try {
+    return { inputPath, text: await readSourceFile(inputPath) };
+  } catch (error) {
+    if (options.input || !(error instanceof IntakeError)) throw error;
+    throw new IntakeError(`${error.message} The config's "input" is read relative to the config file; fix it or pass --input FILE.`);
+  }
 }
 
 async function loadEvents(options, label) {
@@ -137,8 +152,7 @@ async function commandProfile(options, label) {
 async function commandMap(options, label) {
   if (!options.config) throw new UsageError('map needs --config PATH');
   const salt = readSalt();
-  const { config, path: configPath, inputPath: configInput } = await loadMappingConfig(options.config);
-  checkCustomerLocation(configPath, 'mapping config', { label });
+  const { config, inputPath: configInput } = await configFor(options, label);
   const { inputPath, text } = await sourceFor(options, { inputPath: configInput }, label);
   const { parsed } = profileStep(text, { fileName: basename(inputPath), label, source: config.source });
   const mapped = mapSource(parsed, config, { salt, label });
@@ -177,8 +191,7 @@ async function commandReadiness(options, label) {
 async function commandRun(options, label) {
   if (!options.config) throw new UsageError('run needs --config PATH');
   const salt = readSalt();
-  const { config, path: configPath, inputPath: configInput } = await loadMappingConfig(options.config);
-  checkCustomerLocation(configPath, 'mapping config', { label });
+  const { config, inputPath: configInput } = await configFor(options, label);
   const directory = resolveOutputDirectory({ name: options.name ?? config.name, out: options.out, label });
   const { inputPath, text } = await sourceFor(options, { inputPath: configInput }, label);
   const scale = Object.fromEntries(['traders', 'holdoutReplicates', 'sweepReplicates', 'horizonDays', 'policies'].filter((key) => options[key] !== undefined).map((key) => [key, options[key]]));
@@ -203,7 +216,9 @@ async function commandRun(options, label) {
   });
   const written = await writeOutputs(directory, result.outputs);
   const { summary } = result;
-  say(label, `run ${summary.name}: ${summary.status}`);
+  // The run name is the output folder's name; say which config it came from when they differ.
+  const runName = options.name ?? config.name;
+  say(label, `run ${runName}${runName === config.name ? '' : ` (mapping config "${config.name}")`}: ${summary.status}`);
   say(label, `rows ${summary.counts.dataRows}, dropped ${summary.counts.droppedRows}, events ${summary.counts.events}, traders ${summary.counts.traders}${summary.counts.tradersUsed !== summary.counts.traders ? ` (${summary.counts.tradersUsed} used)` : ''}`);
   printDrops(label, result.outputs['map-report.json']);
   say(label, `validation: ${summary.validation.valid ? 'valid' : 'INVALID'} (${summary.validation.errorCount} errors)`);
@@ -239,6 +254,10 @@ try {
   if (error instanceof UsageError) {
     console.error(`intake: ${error.message}`);
     process.exitCode = 2;
+  } else if (/Maximum call stack size exceeded|Invalid (array|string) length/.test(error?.message ?? '')) {
+    // An engine limit, not a user error: keep the stack so the failing step can be found.
+    console.error('intake: internal error (a size limit in the code, not a problem with the input). Stack follows.');
+    throw error;
   } else if (error instanceof IntakeError || error instanceof RangeError || error instanceof TypeError) {
     console.error(`intake: ${error.message}`);
     process.exitCode = 1;

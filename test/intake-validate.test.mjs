@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
-import { PROHIBITED_FIELDS, REQUIRED_FIELDS } from '../src/engine/validate.mjs';
+import { PROHIBITED_FIELDS, REQUIRED_FIELDS, validateEvents } from '../src/engine/validate.mjs';
 import { ACCOUNT_IDENTIFIER_FIELDS } from '../src/intake/pii.mjs';
 import { prohibitedKeys, validateMappedEvents } from '../src/intake/validate.mjs';
 import { generateBehavioralDataset } from '../src/synthetic/behavioral-generate.mjs';
@@ -11,7 +11,7 @@ import { generateBehavioralDataset } from '../src/synthetic/behavioral-generate.
 // parseTokenizedCsv itself.
 
 const ingestionSource = await readFile(new URL('../src/lib/ingestion.ts', import.meta.url), 'utf8');
-const { parseTokenizedCsv } = await import('../src/lib/ingestion.ts');
+const { normalizeHeader, parseTokenizedCsv } = await import('../src/lib/ingestion.ts');
 
 function setLiteral(name) {
   const match = ingestionSource.match(new RegExp(`const ${name} = new Set\\(\\[([^\\]]*)\\]\\)`));
@@ -36,25 +36,76 @@ test('the PII lists in validate.mjs and ingestion.ts agree', () => {
   }
 });
 
-test('intake validate is never looser than ingestion.ts', () => {
-  // ingestion.ts only trims and lowercases; intake also maps spaces to "_" (as validate.mjs does)
-  // and splits camelCase, so it rejects a superset: "Email Address" here, accepted there.
-  assert.ok(prohibitedKeys([{ 'Email Address': 'x' }]).length === 1);
-  assert.doesNotThrow(() => parseTokenizedCsv(`${[...REQUIRED_FIELDS, 'Email Address'].join(',')}\n`));
+// Each path's verdict on one header: the upload path (parseTokenizedCsv), the engine
+// (validateEvents), and intake (prohibitedKeys).
+function uploadRejects(header) {
+  try {
+    parseTokenizedCsv(`${[...REQUIRED_FIELDS, header].join(',')}\n`);
+    return false;
+  } catch (error) {
+    return /Direct PII fields are prohibited/.test(error.message);
+  }
+}
+
+function engineRejects(header) {
+  const event = { event_id: 'e1', trader_token: 't1', occurred_at: '2026-01-01T00:00:00Z', type: 'trade', venue_id: 'v1', source_row_number: 1, [header]: 'x' };
+  return validateEvents([event]).errors.some((error) => /prohibited field/.test(error));
+}
+
+function intakeRejects(header) {
+  return prohibitedKeys([{ [header]: 'x' }]).length > 0;
+}
+
+// Spaced, cased, and padded variants of a listed name, which validate.mjs's normalizeField
+// (trim, lowercase, whitespace to "_") maps back to it.
+function spacedVariants(field) {
+  const words = field.split('_');
+  const title = words.map((word) => word[0].toUpperCase() + word.slice(1));
+  return [
+    field.toUpperCase(),
+    words.join(' '),
+    title.join(' '),
+    words.join(' ').toUpperCase(),
+    words.join('  '),
+    words.join('\t'),
+    `  ${title.join(' ')}  `,
+    `\t${field}`
+  ];
+}
+
+test('ingestion.ts normalizes headers the way validate.mjs does', () => {
+  assert.equal(normalizeHeader('  Email   Address '), 'email_address');
+  assert.equal(normalizeHeader('Date\tOf Birth'), 'date_of_birth');
+  for (const field of PROHIBITED_FIELDS) {
+    for (const variant of [field, ...spacedVariants(field)]) assert.equal(normalizeHeader(variant), field, JSON.stringify(variant));
+  }
+  // Required columns still need their exact names: normalizing never loosens that check.
+  const spacedRequired = REQUIRED_FIELDS.map((field) => (field === 'event_id' ? 'Event ID' : field));
+  assert.throws(() => parseTokenizedCsv(`${spacedRequired.join(',')}\n`), /Required columns are missing: event_id/);
 });
 
-test('ingestion.ts and intake validate agree on the listed headers and plain variants', () => {
-  const candidates = [...PROHIBITED_FIELDS, 'Email', ' Phone ', 'market_name', 'stake_amount', 'channel'];
+test('the upload path, the engine, and intake reject the same headers, spaced variants included', () => {
+  const candidates = [
+    ...PROHIBITED_FIELDS,
+    ...[...PROHIBITED_FIELDS].flatMap(spacedVariants),
+    'Email', ' Phone ', 'Email Address', 'IP Address', 'Customer Name', 'Full Name',
+    // Not PII: every path accepts these.
+    'market_name', 'stake_amount', 'channel', 'Stake Amount', 'Account Ref', 'trader token'
+  ];
   for (const header of candidates) {
-    const csv = `${[...REQUIRED_FIELDS, header].join(',')}\n`;
-    let rejected = false;
-    try {
-      parseTokenizedCsv(csv);
-    } catch (error) {
-      rejected = /Direct PII fields are prohibited/.test(error.message);
-    }
-    const intake = prohibitedKeys([{ [header]: 'x' }]).length > 0;
-    assert.equal(intake, rejected, `"${header}": intake ${intake ? 'rejects' : 'accepts'}, ingestion.ts ${rejected ? 'rejects' : 'accepts'}`);
+    const verdicts = { upload: uploadRejects(header), engine: engineRejects(header), intake: intakeRejects(header) };
+    assert.ok(verdicts.upload === verdicts.engine && verdicts.engine === verdicts.intake, `${JSON.stringify(header)}: ${JSON.stringify(verdicts)}`);
+  }
+  for (const header of ['Email Address', 'EMAIL ADDRESS', 'Date of Birth', 'ip address', ' Full  Name ']) assert.ok(uploadRejects(header), header);
+});
+
+test('intake stays a superset: camelCase and punctuation variants only intake rejects', () => {
+  // intake's prohibitedFieldFor also splits camelCase and maps punctuation to "_" (pii.mjs
+  // snakeHeader); the upload path and the engine don't. Never the other way round.
+  for (const header of ['EmailAddress', 'email-address', 'Email.Address', 'dateOfBirth', 'ipAddress']) {
+    assert.equal(intakeRejects(header), true, header);
+    assert.equal(uploadRejects(header), false, header);
+    assert.equal(engineRejects(header), false, header);
   }
 });
 

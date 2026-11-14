@@ -135,6 +135,18 @@ export function profileSource(parsed, options = {}) {
     else seen.add(key);
   }
 
+  // A loop, not Math.min(...values): spreading a column of hundreds of thousands of values into
+  // one call overflows the stack (found at 700k rows in the Prompt 9 scale run).
+  const range = (numbers) => {
+    let min = Infinity;
+    let max = -Infinity;
+    for (const number of numbers) {
+      if (number < min) min = number;
+      if (number > max) max = number;
+    }
+    return numbers.length ? { min, max } : null;
+  };
+
   const columns = headers.map((header, index) => {
     const rawValues = rows.map((row) => row.cells[index] ?? '');
     const values = [];
@@ -164,7 +176,7 @@ export function profileSource(parsed, options = {}) {
       nullMarkers,
       valuesWithStrayWhitespace: whitespace,
       distinct: new Set(values).size,
-      length: lengths.length ? { min: Math.min(...lengths), max: Math.max(...lengths) } : null,
+      length: range(lengths),
       characterClasses: [...new Set(values.slice(0, 5000).flatMap(characterClasses))].sort(),
       flags: column.flags,
       pii: column.pii,
