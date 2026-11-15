@@ -588,6 +588,59 @@ function runParameters(plan, values) {
   };
 }
 
+// Open settlements in settlement mode, earliest first (then in placement order). A binary
+// heap, because a trader can hold thousands of open trades when lags run to days.
+class SettlementQueue {
+  constructor() {
+    this.items = [];
+  }
+
+  get size() {
+    return this.items.length;
+  }
+
+  peek() {
+    return this.items[0];
+  }
+
+  static before(a, b) {
+    return a.at < b.at || (a.at === b.at && a.seq < b.seq);
+  }
+
+  push(item) {
+    const { items } = this;
+    items.push(item);
+    let index = items.length - 1;
+    while (index > 0) {
+      const parent = (index - 1) >> 1;
+      if (!SettlementQueue.before(items[index], items[parent])) break;
+      [items[index], items[parent]] = [items[parent], items[index]];
+      index = parent;
+    }
+  }
+
+  pop() {
+    const { items } = this;
+    const top = items[0];
+    const last = items.pop();
+    if (items.length) {
+      items[0] = last;
+      let index = 0;
+      for (;;) {
+        const left = 2 * index + 1;
+        const right = left + 1;
+        let smallest = index;
+        if (left < items.length && SettlementQueue.before(items[left], items[smallest])) smallest = left;
+        if (right < items.length && SettlementQueue.before(items[right], items[smallest])) smallest = right;
+        if (smallest === index) break;
+        [items[index], items[smallest]] = [items[smallest], items[index]];
+        index = smallest;
+      }
+    }
+    return top;
+  }
+}
+
 // --- One run ------------------------------------------------------------------------------
 
 function makeStreams(runSeed, reseed) {
@@ -674,7 +727,7 @@ function simulateRun(plan, p, streams, context, replicate, intervention = NO_INT
   const horizonEnd = context.horizonEndSeconds;
   // Settlement mode (simulator-0.3.0, ADR-018). Off: every line below runs as in simulator-0.2.0.
   const settling = p.settlementLag !== null && p.settlementLag !== undefined;
-  const pending = [];
+  const pending = new SettlementQueue();
   let settlementSeq = 0;
 
   const counts = {
@@ -765,12 +818,10 @@ function simulateRun(plan, p, streams, context, replicate, intervention = NO_INT
     }
   };
   const settleUpTo = (time) => {
-    while (pending.length && pending[0].at <= time) applySettlement(pending.shift());
+    while (pending.size && pending.peek().at <= time) applySettlement(pending.pop());
   };
   const schedule = (item) => {
-    let index = pending.length;
-    while (index > 0 && pending[index - 1].at > item.at) index -= 1;
-    pending.splice(index, 0, item);
+    pending.push(item);
   };
   const settlementLatency = (fromSeconds, limitSeconds) => {
     const medianMinutes = lastOutcome === 'loss' ? p.reentryLatencyAfterLoss : p.reentryLatencyAfterWin;
@@ -938,8 +989,8 @@ function simulateRun(plan, p, streams, context, replicate, intervention = NO_INT
         if (refuel) deposit(seconds + 1, 'refuel');
         const limit = seconds + gapSeconds;
         let candidate = seconds + latency;
-        while (pending.length && pending[0].at <= candidate) {
-          const at = pending[0].at;
+        while (pending.size && pending.peek().at <= candidate) {
+          const at = pending.peek().at;
           settleUpTo(at);
           candidate = Math.max(at, settlementLatency(at, limit));
         }
