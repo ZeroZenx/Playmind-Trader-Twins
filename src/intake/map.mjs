@@ -1,5 +1,6 @@
 /**
- * Intake mapping, version intake-map-0.1.0.
+ * Intake mapping, version intake-map-0.2.0 (0.1.0 plus attributes and row capture for the
+ * derive stage, ADR-017).
  *
  * Applies a column-mapping config to a parsed raw export (source.mjs) and produces analytical
  * events (docs/DATA-DICTIONARY.md). The config states, per source: which column feeds which
@@ -31,7 +32,7 @@ import { classifyColumn, maskValue, PII_RULES_VERSION } from './pii.mjs';
 import { cleanCell, IntakeError, SOURCE_VERSION, Tally } from './source.mjs';
 import { parseNumber, parseTimestamp, resolveTimeZone, TIMESTAMP_FORMATS, VALUES_VERSION } from './values.mjs';
 
-export const MAP_VERSION = 'intake-map-0.1.0';
+export const MAP_VERSION = 'intake-map-0.2.0';
 export const SALT_ENV_VAR = 'PLAYMIND_TOKEN_SALT';
 export const MIN_SALT_LENGTH = 16;
 export const TOKEN_DEFAULTS = Object.freeze({ prefix: 'tr_', hexLength: 16, eventPrefix: 'ev_', eventHexLength: 20 });
@@ -62,7 +63,11 @@ export const DEFAULT_APPLIES_TO = Object.freeze({
   policy_event_value: ['policy_event']
 });
 
-const TOP_LEVEL_KEYS = ['name', 'label', 'description', 'input', 'source', 'venueId', 'trader', 'eventId', 'timestamp', 'eventType', 'fields', 'excludeRows', 'dropExactDuplicates', 'behaviorOptions', 'observationEnd'];
+const TOP_LEVEL_KEYS = ['name', 'label', 'description', 'input', 'source', 'venueId', 'trader', 'eventId', 'timestamp', 'eventType', 'fields', 'attributes', 'excludeRows', 'dropExactDuplicates', 'behaviorOptions', 'observationEnd'];
+export const ATTRIBUTE_KINDS = Object.freeze(['key', 'text', 'number', 'timestamp', 'boolean']);
+export const ATTRIBUTE_NAME_PATTERN = /^[a-z][a-z0-9_]{0,40}$/;
+const DEFAULT_TRUE_VALUES = Object.freeze(['true', 't', 'yes', 'y', '1']);
+const DEFAULT_FALSE_VALUES = Object.freeze(['false', 'f', 'no', 'n', '0']);
 const NAME_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
 
 function configError(message) {
@@ -145,6 +150,95 @@ function resultSpec(spec, where) {
     units: oneOf(spec.units, ['cents', 'dollars'], `${where}.units`),
     appliesTo: appliesTo(spec.appliesTo, 'realized_result', where)
   };
+}
+
+/**
+ * Attributes (intake-map-0.2.0): named source columns read into typed values for the derive
+ * stage (derive.mjs). They are never written to events. kind: key (trimmed text used to join
+ * or group; caseSensitive, default true), text, number ({ units: cents | dollars | none,
+ * sign }), timestamp ({ timezone, default the table's; format, default iso }; read as epoch
+ * ms), boolean ({ trueValues, falseValues }, compared case-insensitively). A blank or
+ * unparseable cell is null; unparseable ones are counted.
+ */
+export function normalizeAttributes(attributes, { where = 'attributes', timezone = null } = {}) {
+  if (attributes === undefined || attributes === null) return {};
+  if (!isPlainObject(attributes)) throw configError(`${where} must be an object of attribute name to spec.`);
+  const result = {};
+  for (const [name, spec] of Object.entries(attributes)) {
+    const at = `${where}.${name}`;
+    if (!ATTRIBUTE_NAME_PATTERN.test(name)) throw configError(`${at}: attribute names are lowercase letters, digits, or "_", starting with a letter.`);
+    checkKeys(spec, ['column', 'kind', 'units', 'sign', 'timezone', 'format', 'trueValues', 'falseValues', 'caseSensitive'], at);
+    const kind = oneOf(spec.kind, ATTRIBUTE_KINDS, `${at}.kind`);
+    const column = requireString(spec.column, `${at}.column`);
+    const allowed = { key: ['caseSensitive'], text: [], number: ['units', 'sign'], timestamp: ['timezone', 'format'], boolean: ['trueValues', 'falseValues'] }[kind];
+    for (const key of ['units', 'sign', 'timezone', 'format', 'trueValues', 'falseValues', 'caseSensitive']) {
+      if (spec[key] !== undefined && !allowed.includes(key)) throw configError(`${at}.${key} does not apply to a ${kind} attribute.`);
+    }
+    const out = { name, kind, column };
+    if (kind === 'key') out.caseSensitive = spec.caseSensitive !== false;
+    if (kind === 'number') {
+      out.units = oneOf(spec.units, UNITS, `${at}.units`, 'none');
+      out.sign = oneOf(spec.sign, SIGNS, `${at}.sign`, 'as-is');
+    }
+    if (kind === 'timestamp') {
+      out.timezone = spec.timezone ?? timezone;
+      if (!out.timezone) throw configError(`${at}.timezone is required.`);
+      try {
+        resolveTimeZone(out.timezone);
+      } catch (error) {
+        throw configError(`${at}.timezone: ${error.message}.`);
+      }
+      out.format = oneOf(spec.format, TIMESTAMP_FORMATS, `${at}.format`, 'iso');
+    }
+    if (kind === 'boolean') {
+      const list = (value, fallback, key) => {
+        if (value === undefined) return [...fallback];
+        if (!Array.isArray(value) || !value.length || value.some((item) => typeof item !== 'string')) throw configError(`${at}.${key} must be a list of strings.`);
+        return value.map((item) => item.trim().toLowerCase());
+      };
+      out.trueValues = list(spec.trueValues, DEFAULT_TRUE_VALUES, 'trueValues');
+      out.falseValues = list(spec.falseValues, DEFAULT_FALSE_VALUES, 'falseValues');
+      if (out.trueValues.some((value) => out.falseValues.includes(value))) throw configError(`${at}: a value is in both trueValues and falseValues.`);
+    }
+    result[name] = out;
+  }
+  return result;
+}
+
+/**
+ * Reads one row's attributes: name -> value, null when blank or unparseable. Problems are
+ * counted in tally by attribute name, never by value.
+ */
+export function readAttributes(specs, cells, index, row, tally) {
+  const values = {};
+  for (const spec of Object.values(specs)) {
+    const text = cells[index.get(spec.column)] ?? '';
+    if (!text) {
+      values[spec.name] = null;
+      continue;
+    }
+    if (spec.kind === 'key') values[spec.name] = spec.caseSensitive ? text : text.toLowerCase();
+    else if (spec.kind === 'text') values[spec.name] = text;
+    else if (spec.kind === 'number') {
+      values[spec.name] = applySign(scaleUnits(readNumber(cells, index.get(spec.column), `attribute ${spec.name}`, row, tally), spec.units), spec.sign);
+    } else if (spec.kind === 'timestamp') {
+      const time = parseTimestamp(text, { format: spec.format, zone: resolveTimeZone(spec.timezone) });
+      if (time.iso) values[spec.name] = Date.parse(time.iso);
+      else {
+        tally.add('fixed', `attribute ${spec.name}: ${time.error}, set to null (unavailable)`, row);
+        values[spec.name] = null;
+      }
+    } else {
+      const folded = text.toLowerCase();
+      if (spec.trueValues.includes(folded)) values[spec.name] = true;
+      else if (spec.falseValues.includes(folded)) values[spec.name] = false;
+      else {
+        tally.add('fixed', `attribute ${spec.name}: not a recognized true or false value, set to null (unavailable)`, row);
+        values[spec.name] = null;
+      }
+    }
+  }
+  return values;
 }
 
 /**
@@ -239,6 +333,7 @@ export function normalizeMappingConfig(config) {
     timestamp: { column: requireString(config.timestamp.column, 'timestamp.column'), timezone, format: oneOf(config.timestamp.format, TIMESTAMP_FORMATS, 'timestamp.format', 'iso') },
     eventType: { column: requireString(config.eventType.column, 'eventType.column'), caseSensitive, typeValues, ignored, fold },
     fields,
+    attributes: normalizeAttributes(config.attributes, { timezone }),
     excludeRows,
     dropExactDuplicates: config.dropExactDuplicates !== false,
     behaviorOptions: { ...(config.behaviorOptions ?? {}), ...(config.observationEnd ? { observationEnd: config.observationEnd } : {}) }
@@ -289,10 +384,11 @@ function referencedColumns(config) {
     }
   }
   for (const rule of config.excludeRows) list.push({ column: rule.column, role: 'excludeRows filter' });
+  for (const spec of Object.values(config.attributes ?? {})) list.push({ column: spec.column, role: `attribute ${spec.name}`, text: spec.kind === 'text' || spec.kind === 'key' });
   return list;
 }
 
-function checkColumns(parsed, config, warnings) {
+export function checkColumns(parsed, config, warnings) {
   const index = new Map(parsed.headers.map((header, position) => [header, position]));
   const references = referencedColumns(config);
   const missing = [...new Set(references.map((reference) => reference.column).filter((column) => !index.has(column)))];
@@ -377,6 +473,13 @@ export function mapSource(parsed, configInput, options = {}) {
   const salt = checkSalt(options.salt);
   const warnings = [];
   const { index, classified } = checkColumns(parsed, config, warnings);
+  const attributeSpecs = config.attributes ?? {};
+  const hasAttributes = Object.keys(attributeSpecs).length > 0;
+  // Derive inputs (intake-0.2.0), kept in memory only and never written: each event's
+  // attributes, and with captureRows every row that has a trader ID and a timestamp,
+  // whatever its type value (a cash ledger replay needs the rows that are not events).
+  const attributes = new WeakMap();
+  const rows = options.captureRows ? [] : null;
 
   const tally = new Tally();
   const unknownTypeShapes = new Map();
@@ -386,6 +489,17 @@ export function mapSource(parsed, configInput, options = {}) {
   const rawIdByToken = new Map();
   const events = [];
   let rowsRead = 0;
+  // A row with an ignored or unknown type value: its drop is already counted, so its
+  // attribute problems go to a tally nobody reads instead of being counted twice.
+  const quiet = new Tally();
+  const captureRow = (cells, line, typeKey) => {
+    const rawId = cells[index.get(config.trader.column)];
+    const time = parseTimestamp(cells[index.get(config.timestamp.column)], { format: config.timestamp.format, zone });
+    if (!rawId || !time.iso) return;
+    const token = traderToken(salt, rawId, { prefix: config.trader.tokenPrefix, hexLength: config.trader.tokenHexLength, caseSensitive: config.trader.caseSensitive });
+    const values = hasAttributes ? readAttributes(attributeSpecs, cells, index, line, quiet) : {};
+    rows.push({ rowNumber: line, traderToken: token, ms: Date.parse(time.iso), typeKey, type: null, attributes: values, event: null });
+  };
 
   for (const row of parsed.rows) {
     rowsRead += 1;
@@ -424,10 +538,12 @@ export function mapSource(parsed, configInput, options = {}) {
     const typeKey = config.eventType.fold(typeText);
     if (config.eventType.ignored.has(typeKey)) {
       tally.add('dropped', `event type value ignored by the mapping ("${config.eventType.ignored.get(typeKey)}")`, line);
+      if (rows) captureRow(cells, line, typeKey);
       continue;
     }
     const mappedType = config.eventType.typeValues.get(typeKey);
     if (!mappedType) {
+      if (rows) captureRow(cells, line, typeKey);
       const shape = maskValue(typeText);
       unknownTypeShapes.set(shape, (unknownTypeShapes.get(shape) ?? 0) + 1);
       tally.add('dropped', 'event type value not in the mapping', line);
@@ -486,6 +602,9 @@ export function mapSource(parsed, configInput, options = {}) {
     if (event.realized_result === null && type === 'trade') tally.add('note', 'trade with no realized result: kept as null (unavailable), never 0', line);
     event.source_row_number = line;
     events.push(event);
+    const values = hasAttributes ? readAttributes(attributeSpecs, cells, index, line, tally) : {};
+    attributes.set(event, values);
+    if (rows) rows.push({ rowNumber: line, traderToken: token, ms: Date.parse(time.iso), typeKey, type, attributes: values, event });
   }
 
   events.sort((a, b) => (a.occurred_at < b.occurred_at ? -1 : a.occurred_at > b.occurred_at ? 1 : a.source_row_number - b.source_row_number));
@@ -506,6 +625,8 @@ export function mapSource(parsed, configInput, options = {}) {
     label,
     mapVersion: MAP_VERSION,
     events,
+    attributes,
+    rows,
     report: {
       label,
       mapVersion: MAP_VERSION,

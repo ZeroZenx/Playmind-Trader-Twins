@@ -1,5 +1,5 @@
 /**
- * npm run intake: local intake for a raw venue export (intake-0.1.0, docs/SPORTTRADE_INTAKE.md).
+ * npm run intake: local intake for a raw venue export (intake-0.2.0, docs/SPORTTRADE_INTAKE.md).
  *
  *   npm run intake -- profile <file> --label L [--categories] [--name RUN | --out DIR]
  *   npm run intake -- map --config PATH --label L [--input FILE] [--name RUN | --out DIR]
@@ -9,6 +9,9 @@
  *                         [--traders N] [--holdout-replicates N] [--sweep-replicates N]
  *                         [--policies a,b] [--horizon-days N]
  *   npm run intake -- fields
+ *
+ * A multi-table config (ADR-017) reads every table's input relative to the config file; --input
+ * replaces the first events table's input only.
  *
  * --label is SYNTHETIC, OBSERVATIONAL, or CUSTOMER; real Sporttrade data is CUSTOMER. Outputs go
  * to data/output/<RUN>/ (gitignored); the run name defaults to the config name or the file name.
@@ -22,9 +25,9 @@
 import { readFile } from 'node:fs/promises';
 import { basename, dirname, extname, resolve } from 'node:path';
 import { POLICY_V2_TYPES } from '../src/engine/policy-sim.mjs';
-import { checkSalt, mapSource, SALT_ENV_VAR } from '../src/intake/map.mjs';
+import { checkSalt, SALT_ENV_VAR } from '../src/intake/map.mjs';
 import {
-  checkCustomerLocation, checkLabel, CUSTOMER_REMINDER, eventsDocument, loadMappingConfig, profileStep,
+  checkCustomerLocation, checkLabel, CUSTOMER_REMINDER, eventsDocument, loadMappingConfig, mapAndDerive, profileStep,
   readSourceFile, resolveOutputDirectory, runIntakePipeline, RUN_NAME_PATTERN, writeOutputs
 } from '../src/intake/pipeline.mjs';
 import { renderProfileText } from '../src/intake/profile.mjs';
@@ -99,16 +102,26 @@ async function configFor(options, label) {
   return loaded;
 }
 
-async function sourceFor(options, config, label) {
-  const inputPath = options.input ? resolve(options.input) : config.inputPath;
-  if (!inputPath) throw new IntakeError('No input file: pass --input or set "input" in the mapping config.');
-  checkCustomerLocation(inputPath, 'input file', { label });
-  try {
-    return { inputPath, text: await readSourceFile(inputPath) };
-  } catch (error) {
-    if (options.input || !(error instanceof IntakeError)) throw error;
-    throw new IntakeError(`${error.message} The config's "input" is read relative to the config file; fix it or pass --input FILE.`);
+// Reads every table's input. --input replaces the first events table's input.
+async function sourcesFor(options, loaded, label) {
+  const tables = {};
+  for (const [name, configured] of Object.entries(loaded.inputPaths)) {
+    const override = name === loaded.config.primary && options.input;
+    const inputPath = override ? resolve(options.input) : configured;
+    if (!inputPath) {
+      throw new IntakeError(loaded.config.multiTable
+        ? `No input file for table "${name}": set "input" on it in the mapping config.`
+        : 'No input file: pass --input or set "input" in the mapping config.');
+    }
+    checkCustomerLocation(inputPath, `input file${loaded.config.multiTable ? ` for table "${name}"` : ''}`, { label });
+    try {
+      tables[name] = { text: await readSourceFile(inputPath), fileName: basename(inputPath), path: inputPath };
+    } catch (error) {
+      if (override || !(error instanceof IntakeError)) throw error;
+      throw new IntakeError(`${error.message} The config's "input" is read relative to the config file; fix it${loaded.config.multiTable ? '' : ' or pass --input FILE'}.`);
+    }
   }
+  return tables;
 }
 
 async function loadEvents(options, label) {
@@ -125,6 +138,12 @@ async function loadEvents(options, label) {
   if (!Array.isArray(document.events)) throw new IntakeError('The events file has no events array. Produce it with npm run intake -- map.');
   if (document.label && document.label !== label) throw new IntakeError(`The events file is labelled ${document.label} but --label is ${label}.`);
   return { events: document.events, path, name: options.name ?? plainName(basename(dirname(path))) };
+}
+
+function printProvenance(label, report) {
+  for (const [field, counts] of Object.entries(report.derive?.byField ?? {})) {
+    say(label, `  ${field}: ${Object.entries(counts).map(([source, count]) => `${source} ${count}`).join(', ')}`);
+  }
 }
 
 function printDrops(label, report) {
@@ -152,14 +171,16 @@ async function commandProfile(options, label) {
 async function commandMap(options, label) {
   if (!options.config) throw new UsageError('map needs --config PATH');
   const salt = readSalt();
-  const { config, inputPath: configInput } = await configFor(options, label);
-  const { inputPath, text } = await sourceFor(options, { inputPath: configInput }, label);
-  const { parsed } = profileStep(text, { fileName: basename(inputPath), label, source: config.source });
-  const mapped = mapSource(parsed, config, { salt, label });
+  const loaded = await configFor(options, label);
+  const { config } = loaded;
+  const tables = await sourcesFor(options, loaded, label);
+  const mapped = mapAndDerive({ tables }, { config, salt, label });
   const directory = resolveOutputDirectory({ name: options.name ?? config.name, out: options.out, label });
   await writeOutputs(directory, { 'events.json': eventsDocument(mapped.events, { label, configName: config.name }), 'map-report.json': mapped.report });
   say(label, `mapped ${mapped.report.input.dataRows} data rows to ${mapped.events.length} events for ${mapped.report.output.traders} traders (${Object.entries(mapped.report.output.byType).map(([type, count]) => `${type} ${count}`).join(', ')})`);
   printDrops(label, mapped.report);
+  say(label, 'sources of derived fields (events per field):');
+  printProvenance(label, mapped.report);
   say(label, `wrote ${directory}`);
 }
 
@@ -191,16 +212,16 @@ async function commandReadiness(options, label) {
 async function commandRun(options, label) {
   if (!options.config) throw new UsageError('run needs --config PATH');
   const salt = readSalt();
-  const { config, inputPath: configInput } = await configFor(options, label);
+  const loaded = await configFor(options, label);
+  const { config } = loaded;
   const directory = resolveOutputDirectory({ name: options.name ?? config.name, out: options.out, label });
-  const { inputPath, text } = await sourceFor(options, { inputPath: configInput }, label);
+  const tables = await sourcesFor(options, loaded, label);
   const scale = Object.fromEntries(['traders', 'holdoutReplicates', 'sweepReplicates', 'horizonDays', 'policies'].filter((key) => options[key] !== undefined).map((key) => [key, options[key]]));
   const started = Date.now();
   let lastStep = null;
   let lastReport = 0;
   const result = runIntakePipeline({
-    text,
-    fileName: basename(inputPath),
+    tables,
     config,
     salt,
     label,
@@ -221,6 +242,8 @@ async function commandRun(options, label) {
   say(label, `run ${runName}${runName === config.name ? '' : ` (mapping config "${config.name}")`}: ${summary.status}`);
   say(label, `rows ${summary.counts.dataRows}, dropped ${summary.counts.droppedRows}, events ${summary.counts.events}, traders ${summary.counts.traders}${summary.counts.tradersUsed !== summary.counts.traders ? ` (${summary.counts.tradersUsed} used)` : ''}`);
   printDrops(label, result.outputs['map-report.json']);
+  say(label, 'sources of derived fields (events per field):');
+  printProvenance(label, result.outputs['map-report.json']);
   say(label, `validation: ${summary.validation.valid ? 'valid' : 'INVALID'} (${summary.validation.errorCount} errors)`);
   if (summary.status === 'complete') {
     say(label, `readiness: ${summary.readiness.parametersEstimable} parameters estimable, ${summary.readiness.parametersNotEstimable} not; ${summary.readiness.balancePath}`);

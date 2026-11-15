@@ -1,6 +1,6 @@
 # Sporttrade intake
 
-How to take Sporttrade's historical export from a raw file to a twin evidence report, which fields we need, and what we still have to ask them. The pipeline is `npm run intake` (`scripts/intake.mjs`, version `intake-0.1.0`). Its logic is in `src/intake/`, and the decisions behind it are in ADR-016 (`docs/DECISIONS.md`).
+How to take Sporttrade's historical export from a raw file to a twin evidence report, which fields we need, and what we still have to ask them. The pipeline is `npm run intake` (`scripts/intake.mjs`, version `intake-0.2.0`). Its logic is in `src/intake/`, and the decisions behind it are in ADR-016 and ADR-017 (`docs/DECISIONS.md`).
 
 The file is CUSTOMER data. It, the mapping config written for it, and every output stay under `data/` (gitignored) or outside the repo. Nothing in this repo holds a Sporttrade value, field list with real values, or result.
 
@@ -113,6 +113,50 @@ A JSON file. Unknown keys are errors, so a typo can't silently drop a field. It 
 | `dropExactDuplicates` | Default true: rows identical after trimming are dropped and counted. Set false if the source has no row ID and identical rows can be real. |
 | `behaviorOptions` | Engine behavior options (for example `sessionGapMinutes`). |
 | `observationEnd` | Optional ISO time the extract ends, for censoring stops and refuels near the end. |
+| `attributes` | Optional. Named columns read into typed values for the derive stage, never written to events: `{ <name>: { column, kind } }`, with `kind` one of `key` (text used to join or group; `caseSensitive`, default true), `text`, `number` (`units` `cents`, `dollars`, or `none`; `sign`), `timestamp` (`timezone`, default the table's; `format`), or `boolean` (`trueValues`, `falseValues`). Attribute columns go through the PII checks. |
+| `derive` | Optional. Per derivable field, an ordered list of methods; the first that gives a value wins (below). |
+
+### Several tables (intake-0.2.0)
+
+A raw export often comes as several files: trades or fills, a cash ledger, orders, markets. A config with `tables` reads each one and joins them (ADR-017). A config without `tables` is a single-file config, as above.
+
+```json
+{
+  "name": "sporttrade-v1",
+  "label": "CUSTOMER",
+  "venueId": "sporttrade",
+  "observationEnd": "2026-06-30T00:00:00Z",
+  "tables": {
+    "fills":   { "role": "events", "input": "raw/fills.csv",   "trader": {...}, "eventId": {...}, "timestamp": {...}, "eventType": {...}, "fields": {...}, "attributes": {...} },
+    "ledger":  { "role": "events", "input": "raw/ledger.csv",  "trader": {...}, "timestamp": {...}, "eventType": {...}, "fields": {...}, "attributes": {...} },
+    "markets": { "role": "lookup", "input": "raw/markets.csv", "key": "market_key", "timezone": "UTC", "attributes": {...} }
+  },
+  "joins": {
+    "market": { "from": "fills.market_key", "to": "markets.market_key" }
+  },
+  "derive": {
+    "realized_result": [{ "method": "signed-pnl", "column": "pnl" }, { "method": "credit-minus-debit", "credit": "credit", "debit": "debit" }]
+  }
+}
+```
+
+| Key | Meaning |
+| --- | --- |
+| `tables.<name>` | A table name is lowercase letters, digits, or `_`. `role` is `events` (default) or `lookup`. `input` is read relative to the config file; `--input` replaces the first events table's input only. |
+| events table | The single-file keys `input`, `source`, `trader`, `eventId`, `timestamp`, `eventType`, `fields`, `attributes`, `excludeRows`, `dropExactDuplicates`. `name`, `label`, `venueId`, `behaviorOptions`, and `observationEnd` are set once, at the top. Every events table must use the same `trader.tokenPrefix`, `tokenHexLength`, and `caseSensitive`. Without `eventId`, event IDs are `row_<line>` per table. |
+| lookup table | `input`, `source`, `attributes`, `key` (the attribute rows are found by, of kind `key`), `timezone` (default for timestamp attributes), `dropExactDuplicates`. No trader column: a lookup column whose header names an account or person is refused. Rows with a blank key are dropped and counted. |
+| `joins.<name>` | `{ from: "<table>.<attribute>", to: "<table>.<attribute>" }`, both `key` attributes, `from` on an events table. A join into an events table matches only rows of the same trader. Key values stay in memory. |
+| `derive.<field>` | An ordered list of `{ method, ...parameters }`. A method may carry its version (`signed-pnl-0.1`). The optional `table` key limits a method to one events table; otherwise it runs on every events table that has the attributes it names. A value mapped straight from a column (`fields`) always comes first. |
+
+Derive methods (intake-derive-0.1.0). Parameters that name attributes refer to attributes of the event's table.
+
+| Field | Method | Parameters | Gives |
+| --- | --- | --- | --- |
+| `realized_result` | `signed-pnl` 0.1 | `column` (number), `perspective` (`trader` default, or `house`) | the signed P&L column |
+| `realized_result` | `credit-minus-debit` 0.1 | `credit`, `debit` (numbers) | credit minus abs(debit); both blank is unavailable |
+| `realized_result` | `payout-minus-stake` 0.1 | `payout` (number) | payout minus the event's stake; either unknown is unavailable |
+
+Every event carries `provenance`: for each derivable field (`stake_amount`, `realized_result`, `placed_at`, `settled_at`, `balance_before`, `balance_after`) that applies to its type, `observed`, `derived:<method>-<version>`, or `assumed`. `placed_at` is assumed when no method gives a decision time (the execution time is used), and `settled_at` when no method gives an outcome time for a trade with a result (the outcome is taken as known before the next trade). A field with no entry is unavailable. `map-report.json` counts events per field per source under `derive.byField`, `npm run intake -- map` prints the counts, and `readiness.md` shows them in "Where derived fields came from".
 
 What map refuses: a mapped column that looks like direct PII (by header, or by email, phone, IP, or person-name shaped values), even as the trader ID; a column whose header names an account or person mapped to anything but `trader.column`; a target that is not a schema field; and a run without a salt. Unmapped columns, including flagged ones, are dropped and listed by name.
 

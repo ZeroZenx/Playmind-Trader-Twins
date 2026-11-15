@@ -23,8 +23,9 @@ import { BEHAVIOR_SIGNAL_DEFINITIONS, BEHAVIOR_VERSION } from '../engine/behavio
 import { TWIN_MODEL_VERSION, TWIN_PARAMETER_DEFINITIONS } from '../engine/estimate.mjs';
 import { HOLDOUT_DEFAULTS, splitHoldout } from '../engine/holdout.mjs';
 import { REQUIRED_FIELDS } from '../engine/validate.mjs';
+import { ASSUMPTIONS, DERIVABLE_FIELDS, PROVENANCE_SCOPE } from './derive.mjs';
 
-export const READINESS_VERSION = 'intake-readiness-0.1.0';
+export const READINESS_VERSION = 'intake-readiness-0.2.0';
 
 const ALL = null;
 /** Event types the engine reads each field on. null: every event. */
@@ -118,6 +119,27 @@ export function fieldCoverage(events) {
   }
   const tradersWithCompleteBalances = [...tradesByTrader.values()].filter((entry) => entry.trades > 0 && entry.withBalances === entry.trades).length;
   return { fields: rows, tradersWithTrades: tradesByTrader.size, tradersWithCompleteBalances };
+}
+
+/**
+ * Coverage of each derivable field by provenance (derive.mjs): of the events the field applies
+ * to, how many are observed, derived (by method), assumed, or unavailable. Events without a
+ * provenance object (not from intake) count as observed when the field has a value.
+ */
+export function provenanceCoverage(events) {
+  const list = Array.isArray(events) ? events : [];
+  return Object.fromEntries(DERIVABLE_FIELDS.map((field) => {
+    const relevant = list.filter((event) => PROVENANCE_SCOPE[field].includes(event.type));
+    const row = { appliesTo: PROVENANCE_SCOPE[field].join(', '), relevant: relevant.length, observed: 0, derived: {}, assumed: 0, unavailable: 0 };
+    for (const event of relevant) {
+      const source = event.provenance?.[field] ?? (isBlank(event[field]) ? null : 'observed');
+      if (source === 'observed') row.observed += 1;
+      else if (source === 'assumed') row.assumed += 1;
+      else if (source) row.derived[source.slice('derived:'.length)] = (row.derived[source.slice('derived:'.length)] ?? 0) + 1;
+      else row.unavailable += 1;
+    }
+    return [field, row];
+  }));
 }
 
 function availability(coverage) {
@@ -289,6 +311,7 @@ export function assessReadiness(events, options = {}) {
     versions: { readiness: READINESS_VERSION, behavior: BEHAVIOR_VERSION, model: TWIN_MODEL_VERSION },
     derivedFrom: 'BEHAVIOR_SIGNAL_DEFINITIONS (src/engine/behavior.mjs) and TWIN_PARAMETER_DEFINITIONS (src/engine/estimate.mjs)',
     fieldCoverage: coverage,
+    provenance: provenanceCoverage(list),
     signals,
     parameters,
     askList: askListFor([...signals, ...parameters]),
@@ -400,6 +423,23 @@ export function renderReadinessMarkdown(readiness) {
   lines.push('');
   lines.push(`Traders with balance fields on every trade: ${readiness.fieldCoverage.tradersWithCompleteBalances} of ${readiness.fieldCoverage.tradersWithTrades}.`);
   lines.push('');
+  if (readiness.provenance) {
+    lines.push('## Where derived fields came from');
+    lines.push('');
+    lines.push('Which derivation methods worked, and what had to be assumed. Observed: a mapped column. Derived: the first configured method that gave a value. Assumed: the engine default. Unavailable: no value and no assumption.');
+    lines.push('');
+    lines.push('| Field | Read on | Observed | Derived | Assumed | Unavailable |');
+    lines.push('| --- | --- | --- | --- | --- | --- |');
+    for (const [field, row] of Object.entries(readiness.provenance)) {
+      const derived = Object.entries(row.derived).map(([method, count]) => `${method}: ${count}`).join(', ') || '0';
+      lines.push(`| \`${field}\` | ${row.appliesTo} | ${row.observed} | ${derived} | ${row.assumed} | ${row.unavailable} |`);
+    }
+    lines.push('');
+    for (const [field, meaning] of Object.entries(ASSUMPTIONS)) {
+      if (readiness.provenance[field]?.assumed) lines.push(`- Assumed \`${field}\`: ${meaning}.`);
+    }
+    lines.push('');
+  }
   for (const [title, items] of [['Behavioral signals', readiness.signals], ['Twin parameters', readiness.parameters]]) {
     lines.push(`## ${title}`);
     lines.push('');

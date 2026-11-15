@@ -48,6 +48,12 @@ const NUMERIC_FIELDS = [
   'realized_result'
 ];
 
+// Optional timestamps (ADR-018): when the trader decided, and when the outcome became known.
+const OPTIONAL_TIMESTAMP_FIELDS = ['placed_at', 'settled_at'];
+// provenance (ADR-017): where each derived field came from. The engine never reads it.
+const PROVENANCE_FIELDS = new Set(['stake_amount', 'realized_result', 'placed_at', 'settled_at', 'balance_before', 'balance_after']);
+const PROVENANCE_VALUE = /^(?:observed|assumed|derived:[a-z][a-z0-9-]*-\d+\.\d+)$/;
+
 function isBlank(value) {
   return value === undefined || value === null || value === '';
 }
@@ -119,6 +125,28 @@ export function validateEvents(events) {
       }
     }
 
+    for (const field of OPTIONAL_TIMESTAMP_FIELDS) {
+      if (!isBlank(event[field]) && (typeof event[field] !== 'string' || Number.isNaN(Date.parse(event[field])))) {
+        errors.push(`Row ${row} has an invalid ${field} value.`);
+      }
+    }
+    const placed = isBlank(event.placed_at) ? NaN : Date.parse(event.placed_at);
+    const settled = isBlank(event.settled_at) ? NaN : Date.parse(event.settled_at);
+    if (!Number.isNaN(settled) && !Number.isNaN(date.getTime()) && settled < Math.min(date.getTime(), Number.isNaN(placed) ? Infinity : placed)) {
+      errors.push(`Row ${row} has settled_at before the trade.`);
+    }
+    if (event.provenance !== undefined) {
+      const provenance = event.provenance;
+      if (provenance === null || typeof provenance !== 'object' || Array.isArray(provenance)) {
+        errors.push(`Row ${row} field provenance must be an object of field to source.`);
+      } else {
+        for (const [field, source] of Object.entries(provenance)) {
+          if (!PROVENANCE_FIELDS.has(field)) errors.push(`Row ${row} provenance names a field that is not derivable: ${field}.`);
+          else if (typeof source !== 'string' || !PROVENANCE_VALUE.test(source)) errors.push(`Row ${row} provenance for ${field} must be observed, assumed, or derived:<method>.`);
+        }
+      }
+    }
+
     if (event.realized_result !== undefined && event.realized_result !== null) realizedCount += 1;
   });
 
@@ -152,4 +180,4 @@ export function sanitizeCsvCell(value) {
   return /^[=+\-@]/.test(text) ? `'${text}` : text;
 }
 
-export { EVENT_TYPES, PROHIBITED_FIELDS, REQUIRED_FIELDS };
+export { EVENT_TYPES, OPTIONAL_TIMESTAMP_FIELDS, PROHIBITED_FIELDS, PROVENANCE_FIELDS, REQUIRED_FIELDS };

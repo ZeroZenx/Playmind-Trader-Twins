@@ -17,7 +17,7 @@ Three groups: what is built, what has been validated on SYNTHETIC data only, and
 | Policies with explicit response assumptions | policy-0.2.0 | `src/engine/policy-sim.mjs`, `npm run policy:sweep` | ADR-013 |
 | Held-out validation against baseline-0.1 and a naive model | holdout-0.1.0 | `src/engine/holdout.mjs`, `npm run twin:holdout` | ADR-014, [MODEL_CARD.md](MODEL_CARD.md) |
 | Evidence report v2 | report-0.2.0 | `src/engine/report-v2.mjs`, `npm run demo` | ADR-015 |
-| Local intake for a raw venue export | intake-0.1.0 | `src/intake/`, `npm run intake` | ADR-016, [SPORTTRADE_INTAKE.md](SPORTTRADE_INTAKE.md) |
+| Local intake for a raw venue export | intake-0.2.0 | `src/intake/`, `npm run intake` | ADR-016, ADR-017, [SPORTTRADE_INTAKE.md](SPORTTRADE_INTAKE.md) |
 
 The intake pipeline runs end to end, on one command, from a raw ledger-shaped export with no market or balance fields to report v2. It tokenizes IDs with a salted HMAC, refuses PII columns, and writes only under `data/`. The upload path (`src/lib/ingestion.ts`) and intake reject the same PII headers, spaced variants included (ADR-016 point 5).
 

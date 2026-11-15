@@ -332,3 +332,27 @@ Consequences:
 - Exact-duplicate removal assumes identical rows are export artifacts. A source without a row ID, where identical rows can be real, needs `dropExactDuplicates: false`.
 - Value-shape PII detection is heuristic. A PII column with unusual formatting can pass the value checks. The header rules and a human review of the mapping are the other guards.
 - Event types mapped to `restriction_event` or `self_exclusion_event` are carried through, but no signal or parameter reads them yet.
+
+## ADR-017: Multi-table intake and a derive stage (intake-0.2.0)
+
+Decision: intake reads several source tables and derives the fields the twin needs from the fields a venue already sends. A venue sends its raw export as is: it won't clean it, add rows, or add fields for us. The pipeline is profile, map (per table), derive, validate, readiness, fit, holdout, sweep. The code is `src/intake/tables.mjs` (configs and lookup tables), `src/intake/derive.mjs` (the derive stage), and `src/intake/pipeline.mjs` (`mapAndDerive`). The config reference is in `docs/SPORTTRADE_INTAKE.md`.
+
+1. **Tables and joins.** A config with `tables` declares each source table with its own `input`, `source` format, and column mapping.
+   - An `events` table maps like a single-file config: its rows become events.
+   - A `lookup` table (orders, markets, contracts) only gives keyed attributes. It has no trader column, and a lookup column whose header names an account or person is refused.
+   - `joins` name the attribute pairs that link tables. A join into an events table (a ledger, say) matches only rows of the same trader.
+   - Every events table must tokenize trader IDs the same way, so one account gets one token everywhere.
+2. **Single-file configs are unchanged.** A config without `tables` is one events table named `main`, read by the same `normalizeMappingConfig`. It maps exactly as in intake-0.1.0, and derive then only adds provenance. The fixture config and its tests run without edits.
+3. **Attributes.** A table's `attributes` read named columns into typed values (`key`, `text`, `number`, `timestamp`, `boolean`). They stay in memory for derive and are never written to an event. Attribute columns go through the same PII checks as mapped fields, and count as mapped.
+4. **Methods.** Each derivation is a named, versioned method (`METHODS` in derive.mjs). The config's `derive` section gives each field an ordered list of methods. The first one that gives a value wins, and the rest are fallbacks. A value mapped straight from a column comes first. A method name may carry its version (`signed-pnl-0.1`); asking for a version this intake doesn't have is an error. Fields whose methods have a fixed order of preference (settled_at, ADR-018) reject a list out of that order.
+5. **Provenance.** Every event gets `provenance`: for each derivable field that applies to its type, `observed` (a mapped column), `derived:<method>-<version>`, or `assumed` (placed_at and settled_at, where the engine's default applies). A field with no value and no assumption has no entry: it is unavailable. The engine never reads provenance. `validateEvents` checks its shape: an object, derivable field names only, and one of the three forms. The map report counts events per field per source, and readiness reports coverage per field by source.
+   - The intake-0.1.0 result modes are the same arithmetic as derive methods, so they carry those labels: `split` is `derived:credit-minus-debit-0.1`, `payout_minus_stake` is `derived:payout-minus-stake-0.1`, and `signed` is `observed`.
+6. **Same rules as before.** Raw files are never modified: derive works on mapped events and in-memory attributes, and every output event is a new object. Nothing prints or stores a raw value: reports carry counts, field names, and method names only. Join keys stay in memory. A result that can't be derived stays null (unavailable), never 0. Derivation is deterministic.
+
+Reason: the twin needs fields a raw export doesn't carry as such: one row per order, when the trader decided, when the outcome became known, and balances. Each is derivable from tables a venue already keeps, in more than one way depending on what the export has. Naming each method and recording which one produced each value keeps every assumption visible in the outputs, and readiness can say what worked and what had to be assumed instead of asking the venue for new fields.
+
+Consequences:
+
+- A multi-table config for a real export names real tables and columns, so it is customer data and lives under `data/`, as single-file configs do.
+- Provenance makes `events.json` larger, by about 80 bytes per trade.
+- Lookup keys are compared as text. Two tables that write one key differently (padding, case) need `caseSensitive: false` or a cleaner key column, or the join finds nothing. The map report counts what each join found.
