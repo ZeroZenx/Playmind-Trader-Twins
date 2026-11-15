@@ -37,7 +37,7 @@ test('the report has the six sections in order, with its label and versions', ()
   assert.match(report.banner, /SYNTHETIC/);
   assert.deepEqual(
     [report.versions.model, report.versions.simulator, report.versions.policy, report.versions.holdout, report.versions.baseline, report.versions.naive],
-    ['twin-0.2.1', 'simulator-0.2.0', 'policy-0.2.0', 'holdout-0.1.0', 'baseline-0.1', 'naive-0.1']
+    ['twin-0.3.0', 'simulator-0.3.0', 'policy-0.2.0', 'holdout-0.1.0', 'baseline-0.1', 'naive-0.1']
   );
   assert.match(report.claim, /Not causal evidence and not an accuracy claim/);
   assert.equal(engine.buildReportV2, buildReportV2);
@@ -156,7 +156,7 @@ test('section 6 states assumptions and limits plainly', () => {
   assert.ok(assumptions.plain.some((line) => /no intervention data/i.test(line)));
   assert.ok(assumptions.plain.some((line) => /SYNTHETIC/.test(line)));
   assert.ok(assumptions.plain.some((line) => /never contacts traders, places trades, or holds funds/.test(line)));
-  assert.deepEqual(assumptions.detail.map((group) => group.title), ['Simulation (simulator-0.2.0)', 'Policy responses (policy-0.2.0)', 'Held-out validation (holdout-0.1.0)', 'Trader labels']);
+  assert.deepEqual(assumptions.detail.map((group) => group.title), ['Simulation (simulator-0.3.0)', 'Policy responses (policy-0.2.0)', 'Held-out validation (holdout-0.1.0)', 'Trader labels']);
   assert.equal(assumptions.detail[2].items, holdout.assumptions);
 });
 

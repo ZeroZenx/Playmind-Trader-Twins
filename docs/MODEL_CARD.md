@@ -2,8 +2,8 @@
 
 Two models and two simulators live in `src/engine/`:
 
-- **twin-0.2.1** (`estimate.mjs`): a behavioral twin per trader, a small set of interpretable parameters with uncertainty. twin-0.2.0 plus `latencySpread` and `depositSpread`, which the simulator needs.
-- **simulator-0.2.0** (`simulate.mjs`, `simulateTwinV2`): simulates twin-0.2.1 twins trade by trade, so a twin reacts to its own losses. Described under Simulation.
+- **twin-0.3.0** (`estimate.mjs`): a behavioral twin per trader, a small set of interpretable parameters with uncertainty. twin-0.2.1 on behavior-0.3.0 observations (outcome timing, ADR-018), plus a settlement-lag distribution when trades carry `settled_at`. twin-0.2.1 was twin-0.2.0 plus `latencySpread` and `depositSpread`.
+- **simulator-0.3.0** (`simulate.mjs`, `simulateTwinV2`): simulates twin-0.3.0 twins trade by trade, so a twin reacts to its own losses, and, with a settlement lag, only once they have settled. Described under Simulation.
 - **policy-0.2.0** (`policy-sim.mjs`, `comparePolicyV2`, `runPolicySweep`): runs responsible-trading policies on simulator-0.2.0, with every trader response a named, swept assumption. Described under Policy simulation.
 - **holdout-0.1.0** (`holdout.mjs`, `runHoldoutValidation`): held-out validation. It fits twins on each trader's earlier data, simulates the later period, and compares the result with what happened, against baseline-0.1 and a naive model. Described under Held-out validation.
 - **Transparent behavioral baseline** (`twin.mjs`, model version 0.1.0, reported as baseline-0.1): aggregate summaries and a seeded simulator whose stakes don't depend on outcomes. It is kept for comparison and described at the end.
@@ -20,13 +20,15 @@ The twin represents how one tokenized trader reacts to what just happened: how t
 - Identity matching.
 - Claims of causal policy impact without valid evaluation.
 
-## twin-0.2.1
+## twin-0.3.0
 
-twin-0.2.1 fits every twin-0.2.0 parameter exactly as before and adds two spreads: `latencySpread` and `depositSpread`. Parameters are stored as rows, so the version change needs no migration.
+twin-0.3.0 fits every twin-0.2.1 parameter on behavior-0.3.0 observations and adds `settlementLagMinutes` and `settlementLagSpread` (ADR-018). Without `settled_at` and `placed_at` every other parameter equals twin-0.2.1's, and the two new ones are not estimable. Two rules changed with outcome timing: base stakes include trades placed before any outcome was known, and the stop sample's affordability rule uses the outcome known after each trade. twin-0.2.1 fitted every twin-0.2.0 parameter as before and added `latencySpread` and `depositSpread`. Parameters are stored as rows, so the version change needs no migration.
+
+**Outcome timing.** When trades carry `settled_at`, every outcome-driven parameter reads what the trader could know: chase and escalation from the first trade placed after an outcome settled, latencies from the settlement time, and stop hazards from the running result of settled outcomes. On SYNTHETIC traders whose outcomes settle after their next trade, this recovers chase and the stop gradient; the behavior-0.2.0 assumption pulls chase toward 1 and flattens the gradient (`test/settlement-recovery.test.mjs`). Without `settled_at` the assumption applies, and readiness reports it untested. Settlement lags are right-censored by the extract end.
 
 ### Inputs
 
-`estimateTwins(events, { dataLabel, behaviorOptions })` reads the analytical event schema (`docs/DATA-DICTIONARY.md`) through the behavior-0.2.0 observations from `buildBehaviorObservations`. It never reads market or contract fields, so the twin works without them.
+`estimateTwins(events, { dataLabel, behaviorOptions })` reads the analytical event schema (`docs/DATA-DICTIONARY.md`) through the behavior-0.3.0 observations from `buildBehaviorObservations`. It never reads market or contract fields, so the twin works without them.
 
 - `dataLabel` is required: SYNTHETIC, OBSERVATIONAL (public data), or CUSTOMER. It is carried into the fit, the priors, and every twin.
 - Needed for everything: `trader_token`, `occurred_at`, and the event type (`trade`, `deposit`, `withdrawal`).
@@ -61,7 +63,7 @@ All amounts are in the event currency. "Outcomes" means `stake_amount` and `real
 
 Every parameter goes through three steps. ADR-011 in `docs/DECISIONS.md` gives the reasons for each choice.
 
-**Raw estimate.** Each trader's own estimate and its sampling variance, from the behavior-0.2.0 observations. Multipliers, stakes, latencies, deposits, and payouts are estimated on the log scale, because the behavior is multiplicative and every noise term is lognormal. A trader's sampling variance uses a moderated spread: their own sample variance averaged with the pooled within-trader variance of all traders, which counts as 5 extra observations. That keeps one or two values from producing a falsely tight interval.
+**Raw estimate.** Each trader's own estimate and its sampling variance, from the behavior-0.3.0 observations. Multipliers, stakes, latencies, deposits, and payouts are estimated on the log scale, because the behavior is multiplicative and every noise term is lognormal. A trader's sampling variance uses a moderated spread: their own sample variance averaged with the pooled within-trader variance of all traders, which counts as 5 extra observations. That keeps one or two values from producing a falsely tight interval.
 
 **Population prior.** For each parameter, a prior is fitted to every trader's raw estimate in the same dataset by the method of moments, with each trader's sampling noise taken out. For log-scale parameters the prior is normal: its between-trader variance comes from the DerSimonian-Laird formula, floored above zero, and its center is the mean weighted by 1 / (sampling variance + between-trader variance). For probabilities the prior is a beta distribution fitted the same way, with the binomial variance as the sampling noise. For the idle time it is an inverse-gamma distribution whose mean and variance match the traders' mean idle times, net of exponential sampling noise. A prior needs at least 3 traders with observations.
 
@@ -109,13 +111,15 @@ Recovery on SYNTHETIC traders with known parameters (`test/twin-recovery.test.mj
 
 `db/migrations/0001_twin_v02_parameters.sql` adds per-parameter rows (`trader_twin_parameters`: status, estimate, interval, n, shrinkage weight, raw value, prior value, reason, posterior), the data label, behavior version, and stop-hazard basis on `trader_twins`, and one population prior per dataset and model version (`twin_population_priors`). Store the model version, behavior version, data label, training window, and options with every fit.
 
-## Simulation (simulator-0.2.0)
+## Simulation (simulator-0.3.0)
+
+simulator-0.3.0 is simulator-0.2.0 plus settlement mode (ADR-018). A twin with its own settlement-lag estimate settles each trade after a drawn lag: the stake is debited at placement and the payout credited at settlement, the trader reacts only to settled outcomes, and each outcome that settles before the next attempt moves it to the latency for that outcome after the settlement. A twin without one runs exactly as in simulator-0.2.0, and the new random streams are never drawn.
 
 `simulateTwinV2(fit, options)` in `src/engine/simulate.mjs` simulates twins trade by trade, so a simulated trader reacts to what just happened. ADR-012 in `docs/DECISIONS.md` gives the reasons for each choice. Results are simulations under stated assumptions, never causal claims, and never a forecast for a real trader.
 
 ### Inputs
 
-- An `estimateTwins` fit with model version twin-0.2.1. Parameters come only from that fit: each parameter's stored `posterior`, or its population-prior `fallback`. The fit's data label, behavior options (session gap, refuel window, bucket edges, low-balance multiple, losing-streak length), and each twin's stop basis and stored loss quantiles carry through. No market or contract field is read.
+- An `estimateTwins` fit with model version twin-0.3.0. Parameters come only from that fit: each parameter's stored `posterior`, or its population-prior `fallback`. The fit's data label, behavior options (session gap, refuel window, bucket edges, low-balance multiple, losing-streak length), and each twin's stop basis and stored loss quantiles carry through. No market or contract field is read.
 - Options: `seed`, `replicates` (200 by default), `uncertainty` (on by default), the horizon (`horizonDays`, 28 by default, or `sessions`, a count per trader), `start` (by default, the end of the training window), `startingBalances` (each trader's last observed `balance_after`, from `lastObservedBalances(events)`), and `maxTradesPerSession` (200).
 
 ### Method
@@ -157,7 +161,7 @@ Per run, the harm metrics are the deepest session drawdown (in currency and in b
 
 ### Inputs
 
-- An `estimateTwins` fit (twin-0.2.1), with simulator-0.2.0's options (seed, replicates, uncertainty, start, starting balances), except that the horizon must be in days.
+- An `estimateTwins` fit (twin-0.3.0), with simulator-0.3.0's options (seed, replicates, uncertainty, start, starting balances), except that the horizon must be in days.
 - A policy, validated by `validatePolicyV2`, with thresholds in currency:
   - `cooldown`: `durationMinutes`, `lossStreak` (default 3), and optionally `drawdownThreshold`.
   - `deposit_limit`: `dailyLimit` per UTC day.

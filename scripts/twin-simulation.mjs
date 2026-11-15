@@ -1,5 +1,5 @@
 /**
- * simulator-0.2.0 calibration on SYNTHETIC traders.
+ * simulator-0.3.0 calibration on SYNTHETIC traders.
  *
  *   npm run twin:simulation -- [--seed N] [--traders N] [--replicates N] [--out DIR]
  *

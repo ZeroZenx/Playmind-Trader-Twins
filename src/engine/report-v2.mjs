@@ -1,7 +1,7 @@
 /**
  * Evidence report v2, version report-0.2.0.
  *
- * buildReportV2 turns one dataset, its twin fit (twin-0.2.1), its held-out validation
+ * buildReportV2 turns one dataset, its twin fit (twin-0.3.0), its held-out validation
  * (holdout-0.1.0), and one policy sweep (policy-0.2.0) into a JSON report with six
  * sections, in this order:
  *   1. data: the label, a dataset summary, field coverage, and which twin parameters the
@@ -30,6 +30,7 @@ import { DRAWDOWN_BUCKETS } from './behavior.mjs';
 import { DATA_LABELS, TWIN_MODEL_VERSION, TWIN_PARAMETER_DEFINITIONS, TWIN_PARAMETER_NAMES } from './estimate.mjs';
 import { HOLDOUT_METRICS } from './holdout.mjs';
 import { POLICY_ASSUMPTIONS } from './policy-sim.mjs';
+import { SIMULATOR_VERSION } from './simulate.mjs';
 import { median, quantile } from './stats.mjs';
 
 export const REPORT_V2_VERSION = 'report-0.2.0';
@@ -556,7 +557,7 @@ function assumptionsSection(dataLabel, fit, holdout, sweep, settings) {
     plain,
     limits,
     detail: [
-      { title: 'Simulation (simulator-0.2.0)', items: sweep.assumptions.simulation },
+      { title: `Simulation (${SIMULATOR_VERSION})`, items: sweep.assumptions.simulation },
       { title: 'Policy responses (policy-0.2.0)', items: POLICY_ASSUMPTIONS },
       { title: 'Held-out validation (holdout-0.1.0)', items: holdout.assumptions },
       { title: 'Trader labels', items: sweep.labels.notes ?? [] }
@@ -643,7 +644,7 @@ export function escapeHtml(value) {
 
 const PALETTE = Object.freeze(['#0072B2', '#D55E00', '#009E73', '#CC79A7', '#56B4E9', '#E69F00', '#555555']);
 const MODEL_STYLE = Object.freeze({
-  twin: { color: '#0072B2', label: 'twin-0.2.1', shape: 'circle' },
+  twin: { color: '#0072B2', label: TWIN_MODEL_VERSION, shape: 'circle' },
   truth: { color: '#009E73', label: 'truth (reference)', shape: 'diamond' },
   baseline: { color: '#D55E00', label: 'baseline-0.1', shape: 'square' },
   naive: { color: '#CC79A7', label: 'naive-0.1', shape: 'triangle' }

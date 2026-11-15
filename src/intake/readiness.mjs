@@ -46,7 +46,9 @@ export const FIELD_SCOPE = Object.freeze({
   market_id: ['trade'],
   market_type: ['trade'],
   policy_event_type: ['policy_event'],
-  policy_event_value: ['policy_event']
+  policy_event_value: ['policy_event'],
+  placed_at: ['trade'],
+  settled_at: ['trade']
 });
 const BALANCE_FIELDS = Object.freeze(['balance_before', 'balance_after']);
 
@@ -140,6 +142,77 @@ export function provenanceCoverage(events) {
     }
     return [field, row];
   }));
+}
+
+/**
+ * Below this share of resolved trades known before the trader's next trade, outcome timing is
+ * flagged as low (ADR-018). Below one half, for most resolved trades "the next trade" and "the
+ * first trade placed after the outcome was known" are different trades, so the behavior-0.2.0
+ * reading (every trade reacts to the previous outcome) would misread more reactions than it
+ * reads right. It is a reporting threshold, not a model parameter: nothing is fitted with it.
+ */
+export const OUTCOME_TIMING_LOW_SHARE = 0.5;
+
+/**
+ * The share of resolved trades whose outcome was known before the trader's next trade, from
+ * settled_at (observed or derived; an assumed settlement time is known by assumption and is
+ * counted apart). Known before the next trade: settled_at at or before the next trade's time
+ * (placed_at, else occurred_at), the behavior-0.3.0 rule. Overall, and by market_type when
+ * trades carry it.
+ */
+export function outcomeTiming(events) {
+  const byTrader = new Map();
+  for (const event of Array.isArray(events) ? events : []) {
+    if (event?.type !== 'trade') continue;
+    const placed = typeof event.placed_at === 'string' ? Date.parse(event.placed_at) : NaN;
+    const t = Number.isNaN(placed) ? Date.parse(event.occurred_at) : placed;
+    if (Number.isNaN(t)) continue;
+    if (!byTrader.has(event.trader_token)) byTrader.set(event.trader_token, []);
+    byTrader.get(event.trader_token).push({ event, t });
+  }
+  const overall = { comparable: 0, knownBeforeNext: 0 };
+  const byType = new Map();
+  let resolved = 0;
+  let withTime = 0;
+  for (const trades of byTrader.values()) {
+    trades.sort((a, b) => a.t - b.t || (a.event.source_row_number ?? 0) - (b.event.source_row_number ?? 0) || String(a.event.event_id).localeCompare(String(b.event.event_id)));
+    trades.forEach(({ event, t }, index) => {
+      if (!isFiniteNumber(event.realized_result)) return;
+      resolved += 1;
+      const settled = typeof event.settled_at === 'string' ? Date.parse(event.settled_at) : NaN;
+      if (Number.isNaN(settled) || settled < t) return;
+      withTime += 1;
+      const next = trades[index + 1];
+      if (!next) return;
+      const known = settled <= next.t;
+      overall.comparable += 1;
+      if (known) overall.knownBeforeNext += 1;
+      if (!isBlank(event.market_type)) {
+        const entry = byType.get(event.market_type) ?? { comparable: 0, knownBeforeNext: 0 };
+        entry.comparable += 1;
+        if (known) entry.knownBeforeNext += 1;
+        byType.set(event.market_type, entry);
+      }
+    });
+  }
+  const share = (entry) => (entry.comparable ? entry.knownBeforeNext / entry.comparable : null);
+  const overallShare = share(overall);
+  return {
+    resolvedTrades: resolved,
+    withSettlementTime: withTime,
+    assumed: resolved - withTime,
+    comparable: overall.comparable,
+    knownBeforeNext: overall.knownBeforeNext,
+    share: overallShare,
+    lowShareThreshold: OUTCOME_TIMING_LOW_SHARE,
+    low: overallShare !== null && overallShare < OUTCOME_TIMING_LOW_SHARE,
+    byMarketType: [...byType.entries()]
+      .map(([marketType, entry]) => ({ marketType, ...entry, share: share(entry), low: share(entry) !== null && share(entry) < OUTCOME_TIMING_LOW_SHARE }))
+      .sort((a, b) => b.comparable - a.comparable || (a.marketType < b.marketType ? -1 : 1)),
+    note: withTime === 0
+      ? 'No settlement times: every outcome is assumed known before the next trade (the behavior-0.2.0 rule), and the assumption is untested.'
+      : `Of resolved trades with a settlement time and a later trade by the same trader, the share whose outcome was known before that next trade. Below ${OUTCOME_TIMING_LOW_SHARE} it is flagged low (ADR-018): most "next trades" were then placed before the outcome was known, so behavior-0.3.0 reads reactions from settled_at instead.`
+  };
 }
 
 function availability(coverage) {
@@ -305,6 +378,7 @@ export function assessReadiness(events, options = {}) {
     }
   }
   const count = (items, status) => items.filter((item) => item.status.startsWith(status)).length;
+  const timing = outcomeTiming(list);
   return {
     label,
     readinessVersion: READINESS_VERSION,
@@ -312,6 +386,7 @@ export function assessReadiness(events, options = {}) {
     derivedFrom: 'BEHAVIOR_SIGNAL_DEFINITIONS (src/engine/behavior.mjs) and TWIN_PARAMETER_DEFINITIONS (src/engine/estimate.mjs)',
     fieldCoverage: coverage,
     provenance: provenanceCoverage(list),
+    outcomeTiming: timing,
     signals,
     parameters,
     askList: askListFor([...signals, ...parameters]),
@@ -323,7 +398,9 @@ export function assessReadiness(events, options = {}) {
       parametersNotEstimable: count(parameters, 'not estimable'),
       balancePath: coverage.tradersWithCompleteBalances === 0
         ? 'no balance fields: all-cause stop hazards and proxy (losing-streak) refuel'
-        : coverage.tradersWithCompleteBalances === coverage.tradersWithTrades ? 'balance fields on every trade' : 'balance fields on every trade for some traders only'
+        : coverage.tradersWithCompleteBalances === coverage.tradersWithTrades ? 'balance fields on every trade' : 'balance fields on every trade for some traders only',
+      outcomeTimingShare: timing.share,
+      outcomeTimingLow: timing.low
     }
   };
 }
@@ -423,6 +500,23 @@ export function renderReadinessMarkdown(readiness) {
   lines.push('');
   lines.push(`Traders with balance fields on every trade: ${readiness.fieldCoverage.tradersWithCompleteBalances} of ${readiness.fieldCoverage.tradersWithTrades}.`);
   lines.push('');
+  if (readiness.outcomeTiming) {
+    const timing = readiness.outcomeTiming;
+    lines.push('## Outcome timing');
+    lines.push('');
+    lines.push(timing.note);
+    lines.push('');
+    if (timing.share !== null) {
+      lines.push(`Known before the next trade: ${timing.knownBeforeNext} of ${timing.comparable} (${pct(timing.share)})${timing.low ? `. **Low**: below ${pct(timing.lowShareThreshold)}.` : '.'} Resolved trades: ${timing.resolvedTrades}, with a settlement time: ${timing.withSettlementTime}, assumed: ${timing.assumed}.`);
+      if (timing.byMarketType.length) {
+        lines.push('');
+        lines.push('| Market type | Known before next | Share | Low |');
+        lines.push('| --- | --- | --- | --- |');
+        for (const row of timing.byMarketType) lines.push(`| ${row.marketType} | ${row.knownBeforeNext} of ${row.comparable} | ${pct(row.share)} | ${row.low ? 'yes' : ''} |`);
+      }
+    }
+    lines.push('');
+  }
   if (readiness.provenance) {
     lines.push('## Where derived fields came from');
     lines.push('');

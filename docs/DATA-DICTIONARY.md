@@ -23,6 +23,9 @@
 | policy_event_type | string | no | Policy action type |
 | policy_event_value | number or string | no | Policy action value |
 | realized_result | number | no | Realized result when supplied |
+| placed_at | ISO timestamp | no | When the trader decided (the order was created). Without it, occurred_at. ADR-018 |
+| settled_at | ISO timestamp | no | When the trade's outcome became known. Without it, the outcome is taken as known before the trader's next trade. Never before the trade. ADR-018 |
+| provenance | object | no | Where each derived field came from: `observed`, `derived:<method>-<version>`, or `assumed` (ADR-017). The engine never reads it |
 | source_row_number | integer | yes | Source traceability |
 
 ## Missingness rules
@@ -31,10 +34,11 @@
 - Missing payout_amount means unavailable.
 - Missing balance fields reduce signal coverage.
 - Zero means an observed zero, not a missing value.
+- Missing settled_at means the outcome is taken as known before the next trade (the behavior-0.2.0 rule), not that it settled at the trade time. Missing placed_at means occurred_at is the decision time.
 
 ## Behavioral signals
 
-Definition version `behavior-0.2.0`. `buildBehaviorSignals(events, options)` in `src/engine/behavior.mjs` returns one record per trader. These signals describe how a trader reacts to what just happened. None of them reads a market or contract field.
+Definition version `behavior-0.3.0` (ADR-018): behavior-0.2.0 plus outcome timing. Without `settled_at` and `placed_at` every value equals behavior-0.2.0's. `buildBehaviorSignals(events, options)` in `src/engine/behavior.mjs` returns one record per trader. These signals describe how a trader reacts to what just happened. None of them reads a market or contract field.
 
 Every value has a sample size `n` and a `reason`. If `n` is below the minimum sample size, the value is `null` and `reason` says why. The default minimum is 5. Set `minSampleSize` to change it for all signals, or `minSampleSizes` to change it for one signal. Each record includes the options it was computed with.
 
@@ -59,16 +63,19 @@ Every signal also needs `trader_token`, `occurred_at`, and the event type. The e
 - An outcome is a loss if `realized_result` < 0, a win if > 0, and a push if = 0. A missing `realized_result` is unavailable. It is never counted as a loss, a win, or a push.
 - A missing outcome is never inferred from a balance change. A trade's balance change may show only the stake debit, not the settled result.
 - A stake is usable only if `stake_amount` > 0.
-- Outcomes are assumed to be known before the next trade. The data has no settlement time, so a trade placed while an earlier one is still open is treated as a reaction to that earlier outcome.
+- **Outcome timing.** A trade's time is `placed_at` when present, else `occurred_at`. Its outcome becomes known at `settled_at` when present. Without it, the outcome is known just after the trade, before the trader's next action (the behavior-0.2.0 rule). Each trader's placements and settlements form one timeline. At equal times a settlement comes before a placement.
+- An outcome affects the first trade placed at or after it settles. When several settle between two trades, the later trade responds to the latest one; the others are counted as `superseded`. A trade placed while earlier outcomes were open reacts to what had settled by then: its `previousOutcome` is the latest settled outcome.
+- The session running result, losing runs, and losing streaks update in settlement order, at settlement time, in the session current then. The state after a trade is what had settled when it was placed, its own outcome included only if it settled at once.
+- A trader with any delayed settlement uses the realized path for the running result: balance fields can't say which open outcomes had landed.
 - The observation end defaults to the latest event time in the input, across all traders. Set `observationEnd` when the extract has a known end date. Signals 4 and 5 skip any trigger whose follow-up window runs past the observation end and report it as censored.
 
 ### Definitions
 
-1. **Post-outcome stake response.** For each realized loss or win, take the stake on the trader's next trade, in any session. Divide it by the median of the trader's previous 20 usable stakes (`rollingWindow`). Episodes with fewer than 3 previous stakes (`minStakeHistory`) are skipped. `afterLoss.value` and `afterWin.value` are the median ratios. `lossMinusWin.value` is afterLoss minus afterWin. It is negative for a trader who bets less after losses. `meanLogRatio` and `logRatioDifference` give the same comparison on a log scale. A trade that follows the second or later loss of a losing run in the same session is excluded here and goes to signal 6 instead (ADR-009).
-2. **Re-entry latency.** Minutes from a realized loss or win to the next trade, reported as medians. `anySession` uses the next trade wherever it falls. `withinSession` counts only next trades in the same session. A trade with no later trade in the data has no latency, so latency is conditional on the trader trading again. Signal 4 covers stopping.
+1. **Post-outcome stake response.** For each realized loss or win, take the stake on the first trade placed after it became known, in any session (without `settled_at`: the trader's next trade). Divide it by the median of the trader's previous 20 usable stakes (`rollingWindow`). Episodes with fewer than 3 previous stakes (`minStakeHistory`) are skipped. `afterLoss.value` and `afterWin.value` are the median ratios. `lossMinusWin.value` is afterLoss minus afterWin. It is negative for a trader who bets less after losses. `meanLogRatio` and `logRatioDifference` give the same comparison on a log scale. A trade that follows the second or later loss of a losing run in the same session is excluded here and goes to signal 6 instead (ADR-009).
+2. **Re-entry latency.** Minutes from a realized loss or win becoming known (its `settled_at`, else the trade time) to the first trade placed after it, reported as medians. `anySession` uses the next trade wherever it falls. `withinSession` counts only next trades in the same session. A trade with no later trade in the data has no latency, so latency is conditional on the trader trading again. Signal 4 covers stopping.
 3. **Session drawdown.** The running result after each trade, relative to the session start. The session start is the reference point, not the running peak.
    - Balance path. It is used when the session's first event has `balance_before`, every trade has `balance_after`, and every deposit or withdrawal amount is known. Running result = `balance_after` − session-start balance − net deposits and withdrawals so far in the session.
-   - Realized path, used otherwise: the cumulative `realized_result`. A missing outcome makes the running result unknown from that trade to the end of the session.
+   - Realized path, used otherwise: the cumulative `realized_result` of the outcomes settled in the session so far. A missing outcome makes the running result unknown from that trade to the end of the session.
    - A session's max drawdown is the depth of its lowest running result below zero, or 0 if it never went below. `value` is the median max drawdown across sessions whose running result is known for every trade. `valueInStakes` divides that by the trader's median stake, and `worst` is the largest max drawdown. `sources` counts sessions by path.
 4. **Session stop behavior.** For each trade with a known running result r, the session either ends after it (no later trade in the same session) or continues. `value` is the share of trades in a bucket after which the session ended. M is the trader's median stake.
 
@@ -82,9 +89,9 @@ Every signal also needs `trader_token`, `occurred_at`, and the event type. The e
    Why these edges: within half a typical stake of the start is break-even noise. More than two typical stakes down means the trader has lost about two full bets net in the session. The edges in currency are reported in `stopBehavior.edges`. If the last trade of a session falls within `sessionGapMinutes` of the observation end, it is censored and skipped, because the session might have continued.
 5. **Refuel behavior.** The probability of a deposit within `refuelWindowMinutes` (default 60) after a trigger. A deposit with an observed `deposit_amount` of 0 doesn't count.
    - Low-balance trigger (`lowBalance`). It needs balance fields on every trade. It fires on a trade that takes the balance from at or above the threshold to below it. The threshold is `lowBalanceThreshold` if set. Otherwise it is `lowBalanceStakeMultiple` (default 1) × the median stake, the point where the trader can no longer cover a typical bet.
-   - Losing-streak trigger (`losingStreak`). It fires on the trade that completes `losingStreakLength` (default 3) consecutive realized losses. A deposit, a win, a push, or a missing outcome resets the count.
+   - Losing-streak trigger (`losingStreak`). It fires when the outcome that completes `losingStreakLength` (default 3) consecutive realized losses settles, counted in settlement order; the window runs from that time. A deposit, a win, a push, or a missing outcome resets the count.
    - Both triggers are computed when the fields allow. `primary` names the one to use: `lowBalance` when every trade has balance fields, otherwise `losingStreak`.
-6. **Escalation within session.** Each same-session run of two or more consecutive realized losses is measured against the stake on the trade after the first loss. For each later loss m (m ≥ 2), it compares the stake on the trade after loss m with that reference stake. `logSlope` is the least-squares slope, through the origin, of log(stake after loss m ÷ stake after loss 1) on m − 1. `value` = exp(`logSlope`), the stake multiplier per additional consecutive loss. A value of 1 means no escalation, and below 1 means the trader scales down as losses pile up. `n` counts the (run, m) points. A losing run ends at a session boundary.
+6. **Escalation within session.** Each same-session run of two or more consecutive realized losses, in settlement order, is measured against the stake on the first trade placed after the first loss settled. For each later loss m (m ≥ 2), it compares the stake on the trade after loss m with that reference stake. `logSlope` is the least-squares slope, through the origin, of log(stake after loss m ÷ stake after loss 1) on m − 1. `value` = exp(`logSlope`), the stake multiplier per additional consecutive loss. A value of 1 means no escalation, and below 1 means the trader scales down as losses pile up. `n` counts the (run, m) points. A losing run ends at a session boundary.
 
 ### Options
 
@@ -105,7 +112,7 @@ Every signal also needs `trader_token`, `occurred_at`, and the event type. The e
 
 ### Observations
 
-`buildBehaviorObservations(events, options)` takes the same options and returns, per trader, the observations every signal summarizes: per trade (stake, outcome, previous outcome, same-session losing run, running session result, whether the session ended after it, censoring, balances), deposits with times, signal-1 episodes by side, latencies by outcome, signal-6 points with a run id, and losing-streak refuel episodes. `buildBehaviorSignals` is a summary of these same observations. `lowBalanceRefuelEpisodes(record, threshold)` gives signal 5's low-balance episodes for any threshold. The twin estimator (twin-0.2.1) reads the observations, so it never re-implements a signal definition (`docs/MODEL_CARD.md`). The simulator's `metricsFromEvents` reads them too, so simulated and observed metrics share one definition.
+`buildBehaviorObservations(events, options)` takes the same options and returns, per trader, the observations every signal summarizes: per trade (stake, outcome, previous outcome, same-session losing run, running session result, whether the session ended after it, censoring, balances), deposits with times, signal-1 episodes by side, latencies by outcome, signal-6 points with a run id, and losing-streak refuel episodes. `buildBehaviorSignals` is a summary of these same observations. `lowBalanceRefuelEpisodes(record, threshold)` gives signal 5's low-balance episodes for any threshold. Each trade also carries `afterOutcome`, `knownBefore`, `fresh`, and `settlement` (`basis`, `at`, `lagMinutes`, `knownBeforeNextTrade`). The twin estimator (twin-0.3.0) reads the observations, so it never re-implements a signal definition (`docs/MODEL_CARD.md`). The simulator's `metricsFromEvents` reads them too, so simulated and observed metrics share one definition.
 
 ## Prohibited analytical fields
 

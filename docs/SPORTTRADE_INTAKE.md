@@ -70,8 +70,9 @@ Generated from `BEHAVIOR_SIGNAL_DEFINITIONS` and `TWIN_PARAMETER_DEFINITIONS` by
 | required | `venue_id` | Filled by intake (tokenized source ID or row number, the config venue, the file line). |
 | required | `source_row_number` | Filled by intake (tokenized source ID or row number, the config venue, the file line). |
 | strongly wanted | `stake_amount` | Parameters: baseStake, stakeDispersion, chaseCoefficient, escalationPerLoss, stopHazard, refuelProbability (without it: proxy refuelAfterLosingStreak), payoutMultiple, payoutSpread. Signals: postOutcomeStake, stopBehavior, escalation. Alternative path in signals: refuel. |
-| strongly wanted | `realized_result` | Parameters: baseStake, stakeDispersion, chaseCoefficient, escalationPerLoss, reentryLatencyAfterLoss, reentryLatencyAfterWin, latencySpread, stopHazard, refuelProbability (without it: proxy refuelAfterLosingStreak), refuelAfterLosingStreak, winRate, pushRate, payoutMultiple, payoutSpread. Signals: postOutcomeStake, reentryLatency, escalation. Alternative path in signals: sessionDrawdown, stopBehavior, refuel. |
+| strongly wanted | `realized_result` | Parameters: baseStake, stakeDispersion, chaseCoefficient, escalationPerLoss, reentryLatencyAfterLoss, reentryLatencyAfterWin, latencySpread, stopHazard, refuelProbability (without it: proxy refuelAfterLosingStreak), refuelAfterLosingStreak, winRate, pushRate, payoutMultiple, payoutSpread, settlementLagMinutes, settlementLagSpread. Signals: postOutcomeStake, reentryLatency, escalation. Alternative path in signals: sessionDrawdown, stopBehavior, refuel. |
 | strongly wanted | `deposit_amount` | Parameters: depositSize, depositSpread. |
+| strongly wanted | `settled_at` | Parameters: settlementLagMinutes, settlementLagSpread. |
 | nice to have | `balance_before` | Parameters: refuelProbability (without it: proxy refuelAfterLosingStreak). Alternative path in signals: sessionDrawdown, stopBehavior, refuel. Makes stopHazard voluntary instead of all-cause. |
 | nice to have | `balance_after` | Parameters: refuelProbability (without it: proxy refuelAfterLosingStreak). Alternative path in signals: sessionDrawdown, stopBehavior, refuel. Makes stopHazard voluntary instead of all-cause. |
 | nice to have | `withdrawal_amount` | Not read by any signal or parameter definition. Optional. |
@@ -83,6 +84,7 @@ Generated from `BEHAVIOR_SIGNAL_DEFINITIONS` and `TWIN_PARAMETER_DEFINITIONS` by
 | nice to have | `market_type` | Not read by any signal or parameter definition. Optional. |
 | nice to have | `policy_event_type` | Not read by any signal or parameter definition. Optional. |
 | nice to have | `policy_event_value` | Not read by any signal or parameter definition. Optional. |
+| nice to have | `placed_at` | Not read by any signal or parameter definition. Optional. |
 <!-- intake-fields:end -->
 
 Notes on the table:

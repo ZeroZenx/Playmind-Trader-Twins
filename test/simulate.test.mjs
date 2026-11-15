@@ -51,7 +51,7 @@ test('every result carries the data label, versions, seed, replicate count, and 
   const result = simulateTwinV2(fit, { replicates: 5, horizonDays: 7, traders: tokens.slice(0, 3) });
   assert.equal(result.dataLabel, LABEL);
   assert.equal(result.modelVersion, TWIN_MODEL_VERSION);
-  assert.equal(result.modelVersion, 'twin-0.2.1');
+  assert.equal(result.modelVersion, 'twin-0.3.0');
   assert.equal(result.simulatorVersion, SIMULATOR_VERSION);
   assert.equal(result.seed, SIMULATION_DEFAULTS.seed);
   assert.equal(result.replicates, 5);
@@ -86,7 +86,7 @@ test('options and fits are validated', () => {
   assert.throws(() => simulateTwinV2(fit, { traders: ['nobody'] }), /not in the fit/);
   assert.throws(() => simulateTwinV2(fit, { traders: tokens.slice(0, 2), sessions: { [tokens[0]]: 3 } }), /no count/);
   assert.throws(() => simulateTwinV2(fit, { reseedStreams: { stake: 'x' } }), /unknown stream/);
-  assert.throws(() => simulateTwinV2({ ...fit, modelVersion: 'twin-0.2.0' }), /twin-0\.2\.1/);
+  assert.throws(() => simulateTwinV2({ ...fit, modelVersion: 'twin-0.2.0' }), /twin-0.3.0/);
   assert.throws(() => simulateTwinV2({ ...fit, dataLabel: 'synthetic' }), /dataLabel/);
   assert.throws(() => simulateTwinV2([]), TypeError);
 });

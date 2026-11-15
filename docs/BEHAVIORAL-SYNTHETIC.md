@@ -33,6 +33,7 @@ await writeBehavioralDataset(dataset, 'analysis/output/synthetic');
 | `sessionsPerTrader` | 100 | A positive integer, or `{ min, max }` for a uniform integer draw per trader. Add `scale: 'log'` for a log-uniform draw, `floor(exp(U(log min, log(max + 1))))`, so short histories are common: with `{ min: 2, max: 150, scale: 'log' }` about 4 in 10 traders have 10 or fewer sessions. `scale: 'uniform'` is the default and gives exactly the same output as leaving it out. Raise the counts when a test needs more loss episodes per trader. |
 | `includeBalances` | true | `false` leaves `balance_before` and `balance_after` out of every event. Balances are still simulated. |
 | `missingOutcomeShare` | 0 | Share of trades whose `realized_result` is set to null. Balances are kept. |
+| `settlementDelay` | null | `{ medianMinutes, spread }`: each trade settles after a lognormal lag and carries `settled_at`; the trader reacts only to settled outcomes (ADR-018). The stake is debited at placement and stake plus result credited at settlement; the stop decision uses what had settled when the trade was placed; each outcome that settles before the next trade moves it to the latency for that outcome after the settlement; a refuel deposit lands one second after its trigger. null keeps every rule above unchanged. |
 | `startDate` | `2026-03-02T00:00:00.000Z` | Earliest possible first session. |
 | `venueId` | `synthetic-venue-001` | |
 | `maxTradesPerSession` | 200 | Safety cap. A session that reaches it ends and is counted in `realized.stops.sessionCap`. |

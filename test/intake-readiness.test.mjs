@@ -9,7 +9,9 @@ import { generateBehavioralDataset } from '../src/synthetic/behavioral-generate.
 // Intake readiness (intake-readiness-0.1.0) is derived from BEHAVIOR_SIGNAL_DEFINITIONS and
 // TWIN_PARAMETER_DEFINITIONS. All data here is SYNTHETIC.
 
-const withBalances = generateBehavioralDataset({ seed: 31, mode: 'population', traderCount: 8, sessionsPerTrader: { min: 10, max: 14 } }).events;
+// settled_at (at the trade time) is added so every definition, the settlement lag (ADR-018) included, has its fields.
+const withBalances = generateBehavioralDataset({ seed: 31, mode: 'population', traderCount: 8, sessionsPerTrader: { min: 10, max: 14 } }).events
+  .map((event) => (event.type === 'trade' && event.realized_result !== null ? { ...event, settled_at: event.occurred_at } : event));
 const strip = (events, fields) => events.map((event) => Object.fromEntries(Object.entries(event).filter(([key]) => !fields.includes(key))));
 const noBalances = strip(withBalances, ['balance_before', 'balance_after']);
 const byName = (readiness) => Object.fromEntries([...readiness.signals, ...readiness.parameters].map((item) => [item.name, item]));

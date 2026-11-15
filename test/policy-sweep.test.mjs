@@ -23,7 +23,7 @@ test('the synthetic sweep is SYNTHETIC, labelled, and starts traders at their la
   assert.ok(results.traders.every((trader) => trader.simulable && trader.stopBasis === 'voluntary'));
   assert.deepEqual(results.policies.map((policy) => policy.type), ['stake_limit', 'deposit_limit']);
   const summary = formatPolicySweepSummary(results);
-  assert.match(summary, /policy-0\.2\.0 sweep on twin-0\.2\.1 twins, simulator-0\.2\.0 \(SYNTHETIC\)/);
+  assert.match(summary, /policy-0\.2\.0 sweep on twin-0.3.0 twins, simulator-0.3.0 \(SYNTHETIC\)/);
   assert.match(summary, /assumed rather than estimated/);
   assert.match(summary, /Driver: stake_limit: /);
   assert.throws(() => runSyntheticPolicySweep({ traders: 8 }), /unknown option "traders"/);
@@ -43,7 +43,7 @@ test('npm run policy:sweep writes SYNTHETIC results to the directory it is given
       '--policies', 'cooldown,session_loss_limit', '--out', directory
     ], { encoding: 'utf8' });
     assert.equal(run.status, 0, run.stderr);
-    assert.match(run.stdout, /policy-0\.2\.0 sweep on twin-0\.2\.1 twins, simulator-0\.2\.0 \(SYNTHETIC\)/);
+    assert.match(run.stdout, /policy-0\.2\.0 sweep on twin-0.3.0 twins, simulator-0.3.0 \(SYNTHETIC\)/);
     assert.match(run.stdout, /Runtime: /);
     const files = (await readdir(directory)).sort();
     assert.deepEqual(files, ['policy-sweep-seed3-traders5-replicates2-one-at-a-time.json', 'policy-sweep-seed3-traders5-replicates2-one-at-a-time.traders.jsonl']);

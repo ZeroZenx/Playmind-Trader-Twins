@@ -184,7 +184,11 @@ export const DEFAULT_GENERATOR_OPTIONS = deepFreeze({
   // Safety cap. A session that reaches it ends and is counted in realized.stops.sessionCap.
   maxTradesPerSession: 200,
   // Overrides for SHARED_BEHAVIOR_OPTION_KEYS. Pass the same values to buildBehaviorSignals.
-  behaviorOptions: {}
+  behaviorOptions: {},
+  // Settlement delay (ADR-018): null (outcomes known at once, as before), or { medianMinutes,
+  // spread }: each trade settles after a lognormal lag, and the trader reacts only to settled
+  // outcomes. Trades then carry settled_at. See simulateTraderDelayed.
+  settlementDelay: null
 });
 
 // --- Validation --------------------------------------------------------------
@@ -313,6 +317,12 @@ function resolveOptions(options) {
   if (Number.isNaN(Date.parse(resolved.startDate))) fail('startDate must be a valid timestamp');
   if (typeof resolved.venueId !== 'string' || !resolved.venueId) fail('venueId must be a non-empty string');
   if (!isPositiveInteger(resolved.maxTradesPerSession)) fail('maxTradesPerSession must be a positive integer');
+  if (resolved.settlementDelay !== null) {
+    const delay = resolved.settlementDelay;
+    if (!isPlainObject(delay) || Object.keys(delay).some((key) => !['medianMinutes', 'spread'].includes(key))) fail('settlementDelay must be null or { medianMinutes, spread }');
+    requireNumber(delay.medianMinutes, 'settlementDelay.medianMinutes', { min: 0, exclusiveMin: true });
+    requireNumber(delay.spread, 'settlementDelay.spread', { min: 0, max: 3 });
+  }
   resolved.behaviorOptions = resolveBehaviorOptions(resolved.behaviorOptions);
   resolved.startDate = new Date(Date.parse(resolved.startDate)).toISOString();
   return resolved;
@@ -611,6 +621,174 @@ function simulateTrader(trader, context) {
   return { events, realized };
 }
 
+/**
+ * One trader with a settlement delay (ADR-018). The same parameters and rules as
+ * simulateTrader, except:
+ * - each trade settles settlementDelay.medianMinutes x exp(N(0, spread)) after it is placed;
+ *   the stake is debited at placement and stake + result credited at settlement;
+ * - the trader reacts only to settled outcomes: the chase term follows the latest settled
+ *   outcome, and the session's running result and losing run update when an outcome settles
+ *   (in the session current then);
+ * - the stop decision after a trade uses what had settled when it was placed;
+ * - each outcome that settles before the next trade moves it: the trader re-enters after the
+ *   latency for that outcome, counted from the settlement, within the session gap;
+ * - a refuel deposit (low-balance trigger, at placement) lands 1 second after the trade.
+ * Outcomes landing between sessions change the balance and the latest settled outcome.
+ */
+function simulateTraderDelayed(trader, context) {
+  const p = trader.parameters;
+  const { behavior, maxTradesPerSession, settlementDelay } = context;
+  const rng = createRng(trader.simulationSeed);
+  const gapSeconds = behavior.sessionGapMinutes * MINUTE_SECONDS;
+  const minIdleSeconds = Math.ceil(Math.max(behavior.sessionGapMinutes, behavior.refuelWindowMinutes) * MINUTE_SECONDS) + MINUTE_SECONDS;
+  const meanExtraIdleSeconds = DAY_SECONDS / p.sessionsPerDay;
+  const baseCents = p.baseStake * 100;
+  const lowBalance = behavior.lowBalanceStakeMultiple * p.baseStake;
+
+  const events = [];
+  const realized = {
+    sessions: 0, trades: 0, wins: 0, losses: 0, pushes: 0, chaseEpisodes: 0, escalationEpisodes: 0,
+    tradesByBucket: emptyBucketCounts(),
+    stops: { hazard: emptyBucketCounts(), forced: emptyBucketCounts(), sessionCap: 0 },
+    refuelTriggers: 0,
+    deposits: { sessionStart: 0, sessionStartRaised: 0, refuel: 0 },
+    blankedOutcomes: 0, finalBalance: 0, firstEventAt: null, lastEventAt: null, settledDuringIdle: 0
+  };
+
+  let balance = 0;
+  let lastOutcome = null; // the latest settled outcome, in any session
+  let lastEventSeconds = 0;
+  let running = 0;
+  let lossRun = 0;
+  let inSession = false;
+  const pending = [];
+  const emit = (seconds, type, fields) => {
+    events.push({ seconds, order: events.length, type, ...fields });
+    lastEventSeconds = seconds;
+  };
+  const deposit = (seconds, cents) => {
+    emit(seconds, 'deposit', { depositCents: cents, balanceBeforeCents: balance, balanceAfterCents: balance + cents });
+    balance += cents;
+  };
+  const settleUpTo = (time) => {
+    while (pending.length && pending[0].at <= time) {
+      const item = pending.shift();
+      balance += item.creditCents;
+      lastOutcome = item.outcome;
+      if (inSession) {
+        running += item.resultCents;
+        lossRun = item.outcome === 'loss' ? lossRun + 1 : 0;
+      } else {
+        realized.settledDuringIdle += 1;
+      }
+    }
+  };
+  const drawDepositCents = () => Math.max(1, Math.round(p.depositAmount * 100 * Math.exp(rng.normal(0, p.depositNoise))));
+  const intendedStakeCents = (lossRunInSession) => {
+    let multiplier = 1;
+    if (lastOutcome === 'loss') multiplier *= p.chaseCoefficient;
+    if (lossRunInSession >= 2) multiplier *= p.escalationPerLoss ** (lossRunInSession - 1);
+    return Math.max(1, Math.round(baseCents * multiplier * Math.exp(rng.normal(0, p.stakeNoise))));
+  };
+  const latencySeconds = (outcome) => {
+    const median = outcome === 'loss' ? p.reentryLatencyAfterLoss : p.reentryLatencyAfterWin;
+    return clamp(Math.round(median * MINUTE_SECONDS * Math.exp(rng.normal(0, p.latencyNoise))), MODEL_CONSTANTS.minLatencySeconds, gapSeconds);
+  };
+
+  let seconds = context.startSeconds + Math.floor(rng.next() * DAY_SECONDS);
+  for (let session = 0; session < trader.sessionCount; session += 1) {
+    if (session > 0) seconds = lastEventSeconds + minIdleSeconds + Math.round(-Math.log(1 - rng.next()) * meanExtraIdleSeconds);
+    inSession = false;
+    settleUpTo(seconds);
+    inSession = true;
+    realized.sessions += 1;
+    running = 0;
+    lossRun = 0;
+    let tradesInSession = 0;
+
+    let stake = intendedStakeCents(0);
+    if (balance / 100 < lowBalance || balance < stake) {
+      let amount = drawDepositCents();
+      if (balance + amount < stake) {
+        amount = stake - balance;
+        realized.deposits.sessionStartRaised += 1;
+      }
+      deposit(seconds, amount);
+      realized.deposits.sessionStart += 1;
+      seconds += rng.integer(...MODEL_CONSTANTS.firstTradeDelaySeconds);
+      settleUpTo(seconds);
+    }
+
+    for (;;) {
+      if (lastOutcome === 'loss' && lossRun < 2) realized.chaseEpisodes += 1;
+      if (lossRun >= 2) realized.escalationEpisodes += 1;
+      const before = balance;
+      const u = rng.next();
+      let outcome;
+      let result;
+      if (u < p.winProbability) {
+        outcome = 'win';
+        result = Math.max(1, Math.round(stake * p.payoutMultiple * Math.exp(rng.normal(0, p.payoutNoise))));
+      } else if (u < p.winProbability + p.pushProbability) {
+        outcome = 'push';
+        result = 0;
+      } else {
+        outcome = 'loss';
+        result = -stake;
+      }
+      const lag = Math.max(0, Math.round(settlementDelay.medianMinutes * MINUTE_SECONDS * Math.exp(rng.normal(0, settlementDelay.spread))));
+      balance -= stake;
+      emit(seconds, 'trade', { stakeCents: stake, resultCents: result, balanceBeforeCents: before, balanceAfterCents: balance, settleSeconds: seconds + lag });
+      let index = pending.length;
+      while (index > 0 && pending[index - 1].at > seconds + lag) index -= 1;
+      pending.splice(index, 0, { at: seconds + lag, outcome, resultCents: result, creditCents: stake + result });
+      realized.trades += 1;
+      realized[OUTCOME_COUNT_KEYS[outcome]] += 1;
+      tradesInSession += 1;
+      settleUpTo(seconds); // a zero lag settles at once
+
+      const bucket = drawdownBucket(running / 100, p.baseStake, behavior);
+      realized.tradesByBucket[bucket] += 1;
+      let refuel = false;
+      if (before / 100 >= lowBalance && balance / 100 < lowBalance) {
+        realized.refuelTriggers += 1;
+        refuel = rng.next() < p.refuelProbability;
+      }
+      const hazardStop = rng.next() < p.stopHazard[bucket];
+      if (hazardStop || tradesInSession >= maxTradesPerSession) {
+        if (hazardStop) realized.stops.hazard[bucket] += 1;
+        else realized.stops.sessionCap += 1;
+        if (refuel) {
+          deposit(seconds + 1, drawDepositCents());
+          realized.deposits.refuel += 1;
+        }
+        break;
+      }
+      if (refuel) {
+        deposit(seconds + 1, drawDepositCents());
+        realized.deposits.refuel += 1;
+      }
+      const limit = seconds + gapSeconds;
+      let candidate = seconds + latencySeconds(lastOutcome);
+      while (pending.length && pending[0].at <= candidate) {
+        const at = pending[0].at;
+        settleUpTo(at);
+        candidate = Math.max(at, Math.min(limit, at + latencySeconds(lastOutcome)));
+      }
+      settleUpTo(candidate);
+      const next = intendedStakeCents(lossRun);
+      if (next > balance) {
+        realized.stops.forced[drawdownBucket(running / 100, p.baseStake, behavior)] += 1;
+        break;
+      }
+      seconds = candidate;
+      stake = next;
+    }
+  }
+  realized.finalBalance = balance / 100;
+  return { events, realized };
+}
+
 function toIso(seconds) {
   return new Date(seconds * SECOND_MS).toISOString();
 }
@@ -631,7 +809,8 @@ export function generateBehavioralDataset(options = {}) {
   const context = {
     behavior: resolved.behaviorOptions,
     maxTradesPerSession: resolved.maxTradesPerSession,
-    startSeconds: Math.floor(Date.parse(resolved.startDate) / SECOND_MS)
+    startSeconds: Math.floor(Date.parse(resolved.startDate) / SECOND_MS),
+    settlementDelay: resolved.settlementDelay
   };
 
   const specs = traderSpecs(resolved);
@@ -655,7 +834,7 @@ export function generateBehavioralDataset(options = {}) {
 
   const rows = [];
   const truthTraders = traders.map((trader) => {
-    const { events, realized } = simulateTrader(trader, context);
+    const { events, realized } = resolved.settlementDelay ? simulateTraderDelayed(trader, context) : simulateTrader(trader, context);
     const missingRng = createRng(trader.missingSeed);
     for (const event of events) {
       event.traderIndex = trader.index;
@@ -693,6 +872,7 @@ export function generateBehavioralDataset(options = {}) {
     if (row.type === 'trade') {
       event.stake_amount = row.stakeCents / 100;
       event.realized_result = row.blank ? null : row.resultCents / 100;
+      if (row.settleSeconds !== undefined && !row.blank) event.settled_at = toIso(row.settleSeconds);
     } else {
       event.deposit_amount = row.depositCents / 100;
     }

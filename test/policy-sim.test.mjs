@@ -517,7 +517,7 @@ test('every result carries labels, versions, seed, replicates, the policy config
   const options = { replicates: 3, horizonDays: 7, seed: 99 };
   const result = comparePolicyV2(plainFit, { policy: { type: 'cooldown', durationMinutes: 15 }, assumptions: { leaveProbability: 0.25 } }, options);
   assert.equal(result.dataLabel, LABEL);
-  assert.equal(result.modelVersion, 'twin-0.2.1');
+  assert.equal(result.modelVersion, 'twin-0.3.0');
   assert.equal(result.simulatorVersion, SIMULATOR_VERSION);
   assert.equal(result.policyVersion, POLICY_VERSION);
   assert.equal(POLICY_VERSION, 'policy-0.2.0');

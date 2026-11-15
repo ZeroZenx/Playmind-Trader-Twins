@@ -41,7 +41,7 @@ function within(share, [low, high]) {
 
 test('the calibration population is SYNTHETIC and every trader is simulable', () => {
   assert.equal(results.label, 'SYNTHETIC');
-  assert.equal(results.modelVersion, 'twin-0.2.1');
+  assert.equal(results.modelVersion, 'twin-0.3.0');
   assert.equal(results.scenario.traderCount, CALIBRATION_DEFAULTS.traderCount);
   assert.equal(results.truth.notSimulable, 0);
   assert.equal(results.fitted.notSimulable, 0);
@@ -77,7 +77,7 @@ test('npm run twin:simulation writes SYNTHETIC results to the directory it is gi
   try {
     const run = spawnSync(process.execPath, ['scripts/twin-simulation.mjs', '--traders', '8', '--replicates', '5', '--seed', '3', '--out', directory], { encoding: 'utf8' });
     assert.equal(run.status, 0, run.stderr);
-    assert.match(run.stdout, /simulator-0\.2\.0 calibration on twin-0\.2\.1 twins \(SYNTHETIC\)/);
+    assert.match(run.stdout, /simulator-0.3.0 calibration on twin-0.3.0 twins \(SYNTHETIC\)/);
     const files = (await readdir(directory)).sort();
     assert.deepEqual(files, ['twin-simulation-seed3-traders8-replicates5.json', 'twin-simulation-seed3-traders8-replicates5.traders.jsonl']);
     const summary = JSON.parse(await readFile(join(directory, files[0]), 'utf8'));

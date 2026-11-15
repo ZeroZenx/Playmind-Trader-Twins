@@ -1,9 +1,15 @@
 /**
- * Twin parameter estimation, model version twin-0.2.1.
+ * Twin parameter estimation, model version twin-0.3.0.
  *
- * twin-0.2.1 is twin-0.2.0 plus two spreads the Prompt 4 simulator needs:
- * latencySpread and depositSpread (ADR-012). Every other parameter is fitted
- * exactly as in twin-0.2.0.
+ * twin-0.3.0 is twin-0.2.1 on behavior-0.3.0 observations (outcome timing,
+ * ADR-018), plus a per-trader settlement-lag distribution (settlementLagMinutes
+ * and settlementLagSpread) when trades carry settled_at. Base stakes include
+ * trades placed before any outcome was known, and the stop sample's
+ * affordability rule uses the outcome known after each trade. Without settled_at
+ * and placed_at every other parameter equals twin-0.2.1's.
+ *
+ * twin-0.2.1 was twin-0.2.0 plus two spreads the Prompt 4 simulator needs:
+ * latencySpread and depositSpread (ADR-012).
  *
  * A twin is a small set of interpretable behavioral parameters per trader. Each
  * parameter has a point estimate, a 90% interval, a sample size n, a shrinkage
@@ -54,7 +60,7 @@ import {
   variance
 } from './stats.mjs';
 
-export const TWIN_MODEL_VERSION = 'twin-0.2.1';
+export const TWIN_MODEL_VERSION = 'twin-0.3.0';
 export const DATA_LABELS = Object.freeze(['SYNTHETIC', 'OBSERVATIONAL', 'CUSTOMER']);
 export const PARAMETER_STATUSES = Object.freeze(['estimated', 'prior_only', 'not_estimable']);
 
@@ -215,6 +221,20 @@ export const TWIN_PARAMETER_DEFINITIONS = deepFreeze({
     method: 'normal-normal on log SD',
     requires: OUTCOME_FIELDS,
     fallback: 'prior'
+  },
+  settlementLagMinutes: {
+    description: 'Median minutes from placing a trade to its outcome becoming known (settled_at), on trades with a result. Without settled_at, outcomes are assumed known before the next trade and this is not estimable.',
+    unit: 'minutes',
+    method: 'normal-normal on the median log lag',
+    requires: [...BASE_FIELDS, 'realized_result', 'settled_at'],
+    fallback: 'none: outcomes are known before the next trade (behavior-0.2.0 rule)'
+  },
+  settlementLagSpread: {
+    description: 'Log-scale standard deviation of settlement lags: 1.4826 x the median absolute deviation from the median log lag.',
+    unit: 'log SD',
+    method: 'normal-normal on log SD (MAD-based)',
+    requires: [...BASE_FIELDS, 'realized_result', 'settled_at'],
+    fallback: 'none: outcomes are known before the next trade (behavior-0.2.0 rule)'
   },
   meanIdleMinutes: {
     description: 'Mean minutes from one session\'s last event to the next session\'s first event.',
@@ -595,10 +615,11 @@ function shrinkIdle(raws, offset) {
 
 // --- Observations used by the parameters ----------------------------------------------
 
-// Trades with no chase or escalation term: the trader's first trade, and trades after a win or push.
+// Trades with no chase or escalation term: the trader's first trade, trades placed before any
+// outcome was known (behavior-0.3.0), and trades whose latest known outcome was a win or push.
 function baseLogStakes(record) {
   return record.trades
-    .filter((trade) => trade.stake !== null && (trade.first || trade.previousOutcome === 'win' || trade.previousOutcome === 'push'))
+    .filter((trade) => trade.stake !== null && (trade.first || trade.knownBefore === 0 || trade.previousOutcome === 'win' || trade.previousOutcome === 'push'))
     .map((trade) => Math.log(trade.stake));
 }
 
@@ -787,6 +808,43 @@ function fitLatencySpread(traders) {
   return spread.prior;
 }
 
+/**
+ * Settlement lag (twin-0.3.0, ADR-018): minutes from a trade's time to its observed settled_at,
+ * on trades with a result. Center: the median log lag (lags under minLatencyMinutes are raised
+ * to it), shrunk like the latencies. Spread: 1.4826 x the median absolute deviation of the log
+ * lags from their median, with Var(log SD) = 1.3605 / n, as latencySpread. A trader with no
+ * observed settled_at is not estimable: outcomes are then known before the next trade.
+ */
+function fitSettlementLag(traders) {
+  const floor = ESTIMATE_CONSTANTS.minLatencyMinutes;
+  const logs = traders.map((trader) => {
+    const reason = inputGap(trader, ['outcomes'])
+      ?? (trader.record.inputs.tradesWithSettledAt > 0 ? null : 'settled_at absent: outcomes are assumed known before the next trade');
+    if (reason) return { reason };
+    return { values: trader.record.trades.filter((trade) => trade.settlement?.basis === 'observed').map((trade) => Math.log(Math.max(trade.settlement.lagMinutes, floor))) };
+  });
+  const summaries = logs.map((item) => (item.reason ? item : summarize(item.values, 'median')));
+  const pooled = pooledSpread(summaries.filter((summary) => !summary.reason));
+  const lag = shrinkNormal(summaries.map((summary) => {
+    if (summary.reason) return summary;
+    return { n: summary.n, y: summary.center, se2: samplingVariance(summary, pooled) };
+  }));
+  const spread = shrinkNormal(logs.map((item) => {
+    if (item.reason) return item;
+    const sorted = [...item.values].sort((a, b) => a - b);
+    if (sorted.length < 2) return { n: sorted.length, y: null, se2: null, emptyReason: 'needs 2 or more observed settlement lags' };
+    const center = median(sorted);
+    const sd = 1.4826 * median(sorted.map((value) => Math.abs(value - center)));
+    if (!(sd > 0)) return { n: sorted.length, y: null, se2: null, emptyReason: 'settlement lags have no spread (median absolute deviation 0)' };
+    return { n: sorted.length, y: Math.log(sd), se2: MAD_LOG_VARIANCE / sorted.length };
+  }));
+  traders.forEach((trader, index) => {
+    trader.parameters.settlementLagMinutes = lag.results[index];
+    trader.parameters.settlementLagSpread = spread.results[index];
+  });
+  return { settlementLagMinutes: lag.prior, settlementLagSpread: spread.prior };
+}
+
 function fitDeposits(traders) {
   const summaries = traders.map((trader) => {
     const { deposits } = trader.record;
@@ -875,10 +933,12 @@ function stopSample(trader, behaviorOptions) {
     if (trade.running === null) { excluded.unknownState += 1; continue; }
     if (trade.censored) { excluded.censored += 1; continue; }
     if (voluntary) {
+      // The outcome known after this trade (behavior-0.3.0); without settled_at, its own outcome.
+      const known = trade.afterOutcome === undefined ? trade.outcome : trade.afterOutcome;
       let multiplier = 1;
-      if (trade.outcome === 'loss') {
+      if (known === 'loss') {
         multiplier = chase * (trade.lossRun >= 2 ? escalation ** (trade.lossRun - 1) : 1);
-      } else if (trade.outcome === null) {
+      } else if (known === null) {
         multiplier = Math.max(1, chase); // outcome unknown: assume the larger stake
       }
       const nextStake = baseStake * multiplier;
@@ -1141,6 +1201,7 @@ export function estimateTwins(events, options) {
   Object.assign(priors, fitDeposits(traders));
   Object.assign(priors, fitOutcomeRates(traders));
   Object.assign(priors, fitPayout(traders));
+  Object.assign(priors, fitSettlementLag(traders));
   priors.meanIdleMinutes = fitIdle(traders, behaviorOptions);
 
   const twins = traders.map((trader) => {
@@ -1155,7 +1216,8 @@ export function estimateTwins(events, options) {
       inputs: {
         ...record.inputs,
         hasOutcomes: !trader.missing.outcomes,
-        hasCompleteBalances: balancesComplete(record)
+        hasCompleteBalances: balancesComplete(record),
+        hasSettlementTimes: record.inputs.tradesWithSettledAt > 0
       },
       parameters,
       stopHazardBasis: trader.stopHazardBasis,

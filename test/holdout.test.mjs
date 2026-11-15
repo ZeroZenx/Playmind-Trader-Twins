@@ -331,8 +331,8 @@ test('the no-balance path labels all-cause stops and proxy refuel', () => {
 test('every output carries its label, versions, seed, replicates, split rule, and assumptions', () => {
   assert.equal(result.holdoutVersion, HOLDOUT_VERSION);
   assert.equal(result.dataLabel, 'SYNTHETIC');
-  assert.equal(result.modelVersion, 'twin-0.2.1');
-  assert.equal(result.simulatorVersion, 'simulator-0.2.0');
+  assert.equal(result.modelVersion, 'twin-0.3.0');
+  assert.equal(result.simulatorVersion, 'simulator-0.3.0');
   assert.equal(result.baselineVersion, 'baseline-0.1');
   assert.equal(result.seed, 7);
   assert.equal(result.replicates, 6);

@@ -15,8 +15,8 @@
  * on churn. A trader whose windows are too small gets null plus a reason.
  *
  * Models.
- * - twin: twin-0.2.1 from estimateTwins on every trader's training events, simulated with
- *   simulator-0.2.0 (uncertainty on) from the trader's cut for their test window length
+ * - twin: twin-0.3.0 from estimateTwins on every trader's training events, simulated with
+ *   simulator-0.3.0 (uncertainty on) from the trader's cut for their test window length
  *   in days, starting at their last observed training balance_after.
  * - baseline: baseline-0.1 (simulateBaseline on buildTwins(buildSignals(training
  *   events))), through the adapter baselineEventsToAnalytical.
@@ -943,7 +943,7 @@ function globalAssumptions(settings, split) {
 }
 
 /**
- * Held-out validation of twin-0.2.1 against baseline-0.1 and naive-0.1, with an optional
+ * Held-out validation of twin-0.3.0 against baseline-0.1 and naive-0.1, with an optional
  * truth reference on SYNTHETIC data. options: dataLabel (required) and HOLDOUT_DEFAULTS.
  *
  * Returns { holdoutVersion, dataLabel, modelVersion, simulatorVersion, behaviorVersion,

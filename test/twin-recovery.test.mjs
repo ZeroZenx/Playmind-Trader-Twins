@@ -208,7 +208,7 @@ test('npm run twin:recovery writes SYNTHETIC results to the directory it is give
   try {
     const run = spawnSync(process.execPath, ['scripts/twin-recovery.mjs', '--traders', '30', '--seed', '5', '--out', directory], { encoding: 'utf8' });
     assert.equal(run.status, 0, run.stderr);
-    assert.match(run.stdout, /twin-0\.2\.1 parameter recovery \(SYNTHETIC\)/);
+    assert.match(run.stdout, /twin-0.3.0 parameter recovery \(SYNTHETIC\)/);
     const files = (await readdir(directory)).sort();
     assert.deepEqual(files, ['twin-recovery-seed5-traders30.json', 'twin-recovery-seed5-traders30.traders.jsonl']);
     const summary = JSON.parse(await readFile(join(directory, files[0]), 'utf8'));

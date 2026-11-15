@@ -1,7 +1,12 @@
 /**
- * State-dependent twin simulator, version simulator-0.2.0 (ADR-012).
+ * State-dependent twin simulator, version simulator-0.3.0 (ADR-012, ADR-018).
  *
- * simulateTwinV2(fit, options) takes an estimateTwins fit (model twin-0.2.1) and
+ * simulator-0.3.0 is simulator-0.2.0 plus outcome timing. When a twin has its own
+ * settlement-lag estimate (twin-0.3.0, from settled_at), each simulated trade settles after
+ * a lag drawn from it, and the trader reacts only to settled outcomes (settlement mode,
+ * below). A twin without one runs exactly as in simulator-0.2.0.
+ *
+ * simulateTwinV2(fit, options) takes an estimateTwins fit (model twin-0.3.0) and
  * simulates every twin trade by trade through sessions, many seeded replicates per
  * trader. It returns distributions (median, 10th and 90th percentiles) of harm and
  * activity metrics per trader and for the population, never single numbers.
@@ -54,7 +59,7 @@ import { createRng, stableSeed } from './rng.mjs';
 import { betaSample, gammaSample, median, sum } from './stats.mjs';
 import { simulateTwin } from './twin.mjs';
 
-export const SIMULATOR_VERSION = 'simulator-0.2.0';
+export const SIMULATOR_VERSION = 'simulator-0.3.0';
 export const BASELINE_SIMULATOR_VERSION = 'baseline-0.1';
 export const SUPPORTED_MODEL_VERSIONS = Object.freeze([TWIN_MODEL_VERSION]);
 
@@ -115,7 +120,9 @@ export const METRIC_SETTINGS = deepFreeze({
 // One random stream per kind of decision. 'parameters' has a sub-stream per parameter.
 // 'policy' is drawn only by an intervention (runInfo.policyStream), never by the simulator.
 // Every stream is seeded by name, so adding one moves no other.
-export const STREAMS = Object.freeze(['parameters', 'outcomes', 'stakeNoise', 'latency', 'stops', 'refuel', 'deposits', 'idle', 'policy']);
+// 'settlement' (lags) and 'settlementLatency' (re-entry after a settlement) are drawn only in
+// settlement mode, so a run without it draws exactly what simulator-0.2.0 drew.
+export const STREAMS = Object.freeze(['parameters', 'outcomes', 'stakeNoise', 'latency', 'stops', 'refuel', 'deposits', 'idle', 'policy', 'settlement', 'settlementLatency']);
 
 /**
  * The one hook policies use (ADR-012 point 11, extended in ADR-013). The simulator calls
@@ -177,14 +184,18 @@ export const MECHANISMS = deepFreeze({
   chase: { required: false, parameters: ['chaseCoefficient'] },
   escalation: { required: false, parameters: ['escalationPerLoss'] },
   money: { required: false, parameters: ['depositSize', 'depositSpread'] },
-  refuel: { required: false, parameters: ['refuelProbability', 'refuelAfterLosingStreak'] }
+  refuel: { required: false, parameters: ['refuelProbability', 'refuelAfterLosingStreak'] },
+  // Simulated only from the trader's own estimate (not a population fallback): a trader whose
+  // training had no settled_at keeps the behavior-0.2.0 rule.
+  settlement: { required: false, parameters: ['settlementLagMinutes', 'settlementLagSpread'] }
 });
 
 const DRAW_ORDER = Object.freeze([
   'baseStake', 'stakeDispersion', 'chaseCoefficient', 'escalationPerLoss',
   'reentryLatencyAfterLoss', 'reentryLatencyAfterWin', 'latencySpread', ...BUCKET_PARAMETERS,
   'refuelProbability', 'refuelAfterLosingStreak', 'depositSize', 'depositSpread',
-  'winRate', 'pushRate', 'payoutMultiple', 'payoutSpread', 'meanIdleMinutes'
+  'winRate', 'pushRate', 'payoutMultiple', 'payoutSpread', 'meanIdleMinutes',
+  'settlementLagMinutes', 'settlementLagSpread'
 ]);
 
 const sumOf = (unit, group, description, extra = {}) => ({ group, unit, description, population: { kind: 'sum' }, ...extra });
@@ -466,8 +477,10 @@ function planTrader(twin, settings, behavior) {
   const mechanisms = {};
   for (const [mechanism, spec] of Object.entries(MECHANISMS)) {
     if (mechanism === 'refuel') continue;
-    const missing = spec.parameters.filter((name) => !sources[name]);
-    const reason = missing.length ? missing.map((name) => `${name}: ${unavailable[name]}`).join('; ') : null;
+    const missing = spec.parameters.filter((name) => !sources[name] || (mechanism === 'settlement' && parameterRecord(twin, name)?.status === 'not_estimable'));
+    const reason = missing.length
+      ? missing.map((name) => `${name}: ${unavailable[name] ?? parameterRecord(twin, name)?.reason ?? 'not estimable'}`).join('; ')
+      : null;
     mechanisms[mechanism] = { simulated: !missing.length, reason };
     if (missing.length && spec.required) reasons.push(`the ${mechanism} mechanism can't be simulated (${reason})`);
   }
@@ -480,6 +493,7 @@ function planTrader(twin, settings, behavior) {
     if (name === 'chaseCoefficient') return mechanisms.chase.simulated;
     if (name === 'escalationPerLoss') return mechanisms.escalation.simulated;
     if (name === 'depositSize' || name === 'depositSpread') return mechanisms.money.simulated;
+    if (name === 'settlementLagMinutes' || name === 'settlementLagSpread') return mechanisms.settlement.simulated;
     return true;
   });
   const parameterSources = Object.fromEntries(draw.map((name) => [name, sources[name].source]));
@@ -510,8 +524,11 @@ function planTrader(twin, settings, behavior) {
   }
   assumptions.push(`loss ratio: ${lossRatios.source}`);
   for (const [mechanism, state] of Object.entries(mechanisms)) {
-    if (!state.simulated && mechanism !== 'refuel') assumptions.push(`${mechanism} not simulated: ${state.reason}`);
+    if (!state.simulated && mechanism !== 'refuel' && mechanism !== 'settlement') assumptions.push(`${mechanism} not simulated: ${state.reason}`);
   }
+  assumptions.push(mechanisms.settlement.simulated
+    ? 'settlement: each trade settles after a lag drawn from settlementLagMinutes and settlementLagSpread; the stake is debited at placement and the payout credited at settlement; the trader reacts only to settled outcomes, and re-enters after a settlement with the latency for that outcome.'
+    : 'settlement: outcomes are known at once, before the next trade (no settled_at in training).');
 
   return {
     traderToken,
@@ -564,7 +581,10 @@ function runParameters(plan, values) {
     pushRate: values.pushRate,
     payoutMultiple: values.payoutMultiple,
     payoutSpread: values.payoutSpread,
-    meanIdleMinutes: values.meanIdleMinutes
+    meanIdleMinutes: values.meanIdleMinutes,
+    settlementLag: plan.mechanisms.settlement.simulated
+      ? { medianMinutes: values.settlementLagMinutes, spread: values.settlementLagSpread }
+      : null
   };
 }
 
@@ -652,6 +672,10 @@ function simulateRun(plan, p, streams, context, replicate, intervention = NO_INT
   const sessionTarget = settings.sessions === null ? null
     : (typeof settings.sessions === 'number' ? settings.sessions : settings.sessions[plan.traderToken]);
   const horizonEnd = context.horizonEndSeconds;
+  // Settlement mode (simulator-0.3.0, ADR-018). Off: every line below runs as in simulator-0.2.0.
+  const settling = p.settlementLag !== null && p.settlementLag !== undefined;
+  const pending = [];
+  let settlementSeq = 0;
 
   const counts = {
     trades: 0, sessions: 0, wins: 0, losses: 0, pushes: 0, totalStakeCents: 0, totalResultCents: 0,
@@ -671,6 +695,8 @@ function simulateRun(plan, p, streams, context, replicate, intervention = NO_INT
   let lastLossSeconds = null;
   let lastEventSeconds = null;
   let streak = 0; // signal-5 losing streak, across sessions; a deposit resets it
+  let lowest = 0;
+  let downLarge = false;
 
   let session = 0;
   let seconds = 0;
@@ -716,6 +742,41 @@ function simulateRun(plan, p, streams, context, replicate, intervention = NO_INT
     if (lastLossSeconds !== null && at - lastLossSeconds <= windowSeconds) counts.depositsAfterLoss += 1;
     streak = 0;
   };
+  // Settlement mode: an outcome lands. Its payout (stake + result) is credited, and the state
+  // the trader reacts to moves on, in settlement order, in the session current at that time.
+  const applySettlement = (item) => {
+    if (money) balance += item.creditCents;
+    running += item.resultCents;
+    lastOutcome = item.outcome;
+    lossRun = item.outcome === 'loss' ? lossRun + 1 : 0;
+    streak = item.outcome === 'loss' ? streak + 1 : 0;
+    if (item.outcome === 'loss') lastLossSeconds = item.at;
+    if (running < lowest) lowest = running;
+    bucket = drawdownBucket(running / 100, p.baseStake, behavior);
+    if (bucket === 'down_large' && !downLarge && tradesInSession > 0) {
+      downLarge = true;
+      counts.sessionsDownLarge += 1;
+    }
+    if (trigger === REFUEL_PROXY && streak === streakLength) {
+      counts.refuelTriggers += 1;
+      const refuel = streams.refuel.next() < refuelProbability;
+      streams.refuel.next();
+      if (refuel) deposit(item.at + 1, 'refuel');
+    }
+  };
+  const settleUpTo = (time) => {
+    while (pending.length && pending[0].at <= time) applySettlement(pending.shift());
+  };
+  const schedule = (item) => {
+    let index = pending.length;
+    while (index > 0 && pending[index - 1].at > item.at) index -= 1;
+    pending.splice(index, 0, item);
+  };
+  const settlementLatency = (fromSeconds, limitSeconds) => {
+    const medianMinutes = lastOutcome === 'loss' ? p.reentryLatencyAfterLoss : p.reentryLatencyAfterWin;
+    const latency = Math.max(GENERATOR_RULES.minLatencySeconds, Math.round(medianMinutes * 60 * Math.exp(p.latencySpread * streams.settlementLatency.normal())));
+    return Math.min(limitSeconds, fromSeconds + latency);
+  };
 
   let horizonReached = false;
   for (session = 0; sessionTarget === null || session < sessionTarget; session += 1) {
@@ -728,6 +789,7 @@ function simulateRun(plan, p, streams, context, replicate, intervention = NO_INT
       const excess = Math.max(1, Math.round(-Math.log(1 - idleDraw) * meanExcessSeconds));
       seconds = (lastEventSeconds ?? seconds) + gapSeconds + excess;
     }
+    if (settling) settleUpTo(seconds);
     running = 0;
     lossRun = 0;
     tradesInSession = 0;
@@ -743,8 +805,8 @@ function simulateRun(plan, p, streams, context, replicate, intervention = NO_INT
     if (horizonEnd !== null && seconds >= horizonEnd) break;
 
     const sessionStartSeconds = seconds;
-    let lowest = 0;
-    let downLarge = false;
+    lowest = 0;
+    downLarge = false;
     let attemptsInSession = 0;
     let stake = intendedStake(0);
     if (money && deferredCents > 0) deposit(seconds, 'deferred', 0, deferredCents);
@@ -796,9 +858,18 @@ function simulateRun(plan, p, streams, context, replicate, intervention = NO_INT
           else if (lastOutcome === 'win') counts.chaseNoiseFloor += 1;
         }
         const before = balance;
-        if (money) balance += result;
-        running += result;
-        emit(seconds, 'trade', { stakeCents: stake, resultCents: result, beforeCents: before, afterCents: balance });
+        let settleAt = null;
+        if (settling) {
+          // The stake is debited now; the outcome lands after a drawn lag.
+          if (money) balance -= stake;
+          const lag = Math.max(0, Math.round(p.settlementLag.medianMinutes * 60 * Math.exp(p.settlementLag.spread * streams.settlement.normal())));
+          settleAt = seconds + lag;
+          schedule({ at: settleAt, seq: settlementSeq++, outcome, resultCents: result, creditCents: stake + result });
+        } else {
+          if (money) balance += result;
+          running += result;
+        }
+        emit(seconds, 'trade', { stakeCents: stake, resultCents: result, beforeCents: before, afterCents: balance, settleAt });
         counts.trades += 1;
         counts.totalStakeCents += stake;
         counts.totalResultCents += result;
@@ -806,20 +877,25 @@ function simulateRun(plan, p, streams, context, replicate, intervention = NO_INT
         if (downLarge) counts.tradesOnceDownLarge += 1;
         days.add(Math.floor(seconds / DAY_SECONDS));
         tradesInSession += 1;
-        lastOutcome = outcome;
-        lossRun = outcome === 'loss' ? lossRun + 1 : 0;
-        streak = outcome === 'loss' ? streak + 1 : 0;
-        if (outcome === 'loss') lastLossSeconds = seconds;
-        if (running < lowest) lowest = running;
-        bucket = drawdownBucket(running / 100, p.baseStake, behavior);
-        if (bucket === 'down_large' && !downLarge) {
-          downLarge = true;
-          counts.sessionsDownLarge += 1;
+        if (settling) {
+          settleUpTo(seconds); // a zero lag settles at once
+        } else {
+          lastOutcome = outcome;
+          lossRun = outcome === 'loss' ? lossRun + 1 : 0;
+          streak = outcome === 'loss' ? streak + 1 : 0;
+          if (outcome === 'loss') lastLossSeconds = seconds;
+          if (running < lowest) lowest = running;
+          bucket = drawdownBucket(running / 100, p.baseStake, behavior);
+          if (bucket === 'down_large' && !downLarge) {
+            downLarge = true;
+            counts.sessionsDownLarge += 1;
+          }
         }
 
+        // In settlement mode the losing-streak trigger fires when the streak completes (applySettlement).
         triggered = trigger === REFUEL_LOW_BALANCE
           ? before / 100 >= lowBalance && balance / 100 < lowBalance
-          : trigger === REFUEL_PROXY && streak === streakLength;
+          : !settling && trigger === REFUEL_PROXY && streak === streakLength;
         if (triggered) {
           counts.refuelTriggers += 1;
           refuel = streams.refuel.next() < refuelProbability;
@@ -849,15 +925,33 @@ function simulateRun(plan, p, streams, context, replicate, intervention = NO_INT
       }
       if (ends) {
         counts[`${ends}Stops`] += 1;
-        if (refuel) deposit(seconds + refuelMinSeconds + Math.floor(timingDraw * (refuelMaxSeconds - refuelMinSeconds + 1)), 'refuel');
+        if (refuel) deposit(settling ? seconds + 1 : seconds + refuelMinSeconds + Math.floor(timingDraw * (refuelMaxSeconds - refuelMinSeconds + 1)), 'refuel');
         break;
       }
 
       const reset = decision !== null && decision.reset;
-      const next = intendedStake(reset ? 0 : lossRun);
-      // The refuel deposit lands between this trade and the next, so it doesn't move trade timing.
-      if (refuel) deposit(seconds + 1 + Math.floor(timingDraw * (latency - 1)), 'refuel');
-      seconds += latency;
+      let next;
+      if (settling) {
+        // The refuel deposit lands a second after the trigger trade. Each outcome that settles
+        // before the next attempt moves it: the trader re-enters after the latency for that
+        // outcome, from its settlement, within the session gap. The next stake is set then.
+        if (refuel) deposit(seconds + 1, 'refuel');
+        const limit = seconds + gapSeconds;
+        let candidate = seconds + latency;
+        while (pending.length && pending[0].at <= candidate) {
+          const at = pending[0].at;
+          settleUpTo(at);
+          candidate = Math.max(at, settlementLatency(at, limit));
+        }
+        seconds = candidate;
+        settleUpTo(seconds);
+        next = intendedStake(reset ? 0 : lossRun);
+      } else {
+        next = intendedStake(reset ? 0 : lossRun);
+        // The refuel deposit lands between this trade and the next, so it doesn't move trade timing.
+        if (refuel) deposit(seconds + 1 + Math.floor(timingDraw * (latency - 1)), 'refuel');
+        seconds += latency;
+      }
       if (decision !== null && decision.resumeAtSeconds !== null) {
         // A pause: the next attempt comes when the latency or the pause ends, whichever is later.
         hookCounts.pausesApplied += 1;
@@ -946,6 +1040,7 @@ function simulateRun(plan, p, streams, context, replicate, intervention = NO_INT
       if (event.type === 'trade') {
         row.stake_amount = event.stakeCents / 100;
         row.realized_result = event.resultCents / 100;
+        if (event.settleAt !== null && event.settleAt !== undefined) row.settled_at = toIso(event.settleAt);
       } else {
         row.deposit_amount = event.amountCents / 100;
       }

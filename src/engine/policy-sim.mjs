@@ -1,6 +1,6 @@
 /**
  * Policy simulation with explicit behavioral-response assumptions, version policy-0.2.0
- * (ADR-013). Runs on simulateTwinV2 (simulator-0.2.0) through its intervention hook.
+ * (ADR-013). Runs on simulateTwinV2 (simulator-0.3.0) through its intervention hook.
  *
  * We have no intervention data, so every way a trader responds to a policy is a named
  * assumption with a default value and a default range, swept and reported with every

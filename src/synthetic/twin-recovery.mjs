@@ -1,5 +1,5 @@
 /**
- * Parameter recovery for twin-0.2.1 on SYNTHETIC traders with known parameters.
+ * Parameter recovery for twin-0.3.0 on SYNTHETIC traders with known parameters.
  *
  * test/twin-recovery.test.mjs and scripts/twin-recovery.mjs both call this module,
  * so the test thresholds and the local results file come from one computation. It

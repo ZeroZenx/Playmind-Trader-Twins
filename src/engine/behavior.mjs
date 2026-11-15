@@ -1,9 +1,28 @@
 /**
- * Behavioral signals, definition version behavior-0.2.0.
+ * Behavioral signals, definition version behavior-0.3.0 (ADR-018).
  *
  * These signals describe how a trader reacts to what just happened. They are
  * computed per trader from timestamps, stakes, deposits, withdrawals, and
  * realized result or balance. No market or contract field is read.
+ *
+ * behavior-0.3.0 adds outcome timing. A trade's time is placed_at (when the
+ * trader decided) when present, else occurred_at. An outcome becomes known at
+ * the trade's settled_at when present; without it, just after the trade is
+ * placed (the behavior-0.2.0 rule: known before the trader's next trade). Each
+ * trader's placements and settlements form one timeline, and every signal reads
+ * the state the trader could know at each placement:
+ * - an outcome affects the first trade placed at or after it settles, not
+ *   simply the next trade; when several settle between two trades, the later
+ *   trade responds to the latest one and the others are counted as superseded;
+ * - re-entry latency runs from the settlement time;
+ * - the session running result, losing runs, and losing streaks update in
+ *   settlement order, at settlement time, in the session current then;
+ * - a trade placed while earlier outcomes were still open reacts to what had
+ *   settled by then. The state after a trade (for stopping) is what had
+ *   settled by the moment it was placed, its own outcome included only when it
+ *   settled at once.
+ * Without settled_at and placed_at every result equals behavior-0.2.0's, plus
+ * the keys listed in BEHAVIOR_0_3_ADDITIONS (test/behavior-settlement.test.mjs).
  *
  * Every function here is pure and deterministic: the same events and options
  * give the same output, whatever the input order. Field needs and definitions
@@ -18,7 +37,20 @@
  * re-implements a signal definition.
  */
 
-export const BEHAVIOR_VERSION = 'behavior-0.2.0';
+export const BEHAVIOR_VERSION = 'behavior-0.3.0';
+
+/**
+ * Keys behavior-0.3.0 adds to behavior-0.2.0's output. Without settled_at and
+ * placed_at, removing these (and the version) from 0.3.0's output gives
+ * exactly 0.2.0's output.
+ */
+export const BEHAVIOR_0_3_ADDITIONS = Object.freeze({
+  inputs: Object.freeze(['tradesWithPlacedAt', 'tradesWithSettledAt', 'settlementTimesBeforeTrade']),
+  trades: Object.freeze(['afterOutcome', 'knownBefore', 'fresh', 'settlement']),
+  postOutcomeStakeExcluded: Object.freeze(['noNewOutcome', 'superseded']),
+  reentryLatencyExcluded: Object.freeze(['superseded']),
+  escalationExcluded: Object.freeze(['superseded', 'missingReference'])
+});
 
 export const DRAWDOWN_BUCKETS = Object.freeze(['up', 'flat', 'down_small', 'down_large']);
 
@@ -58,11 +90,11 @@ function definition(description, requires, anyOf = []) {
 
 export const BEHAVIOR_SIGNAL_DEFINITIONS = Object.freeze({
   postOutcomeStake: definition(
-    'Stake on the next trade after a realized loss and after a realized win, each divided by the median of the trader\'s previous stakes. A trade after the second or later loss of a same-session losing run belongs to escalation instead.',
+    'Stake on the first trade placed after a realized loss or win became known, each divided by the median of the trader\'s previous stakes. A trade after the second or later loss of a same-session losing run belongs to escalation instead.',
     ['stake_amount', 'realized_result']
   ),
   reentryLatency: definition(
-    'Minutes from a realized loss or win to the trader\'s next trade, in any session and within the same session.',
+    'Minutes from a realized loss or win becoming known (settled_at, else the trade time) to the first trade placed after it, in any session and within the same session.',
     ['realized_result']
   ),
   sessionDrawdown: definition(
@@ -232,7 +264,6 @@ function structure(rows, options) {
 
     const result = isFiniteNumber(event.realized_result) ? event.realized_result : null;
     const outcome = outcomeOf(result);
-    const previous = session.trades.at(-1);
     const trade = {
       index: trades.length,
       action,
@@ -241,16 +272,118 @@ function structure(rows, options) {
       stake: isFiniteNumber(event.stake_amount) && event.stake_amount > 0 ? event.stake_amount : null,
       result,
       outcome,
-      // Consecutive realized losses ending at this trade, within this session.
-      lossRunInSession: outcome === 'loss' ? (previous?.lossRunInSession ?? 0) + 1 : 0,
-      // Running session result after this trade; null when unknown.
+      settledMs: row.settledMs,
+      // Set by walkTimeline: the state after this trade (at its placement, its own outcome
+      // included only if it settled at once), and what was known before it.
+      lossRunInSession: 0,
+      runningRealized: null,
       running: null
     };
     action.trade = trade;
     trades.push(trade);
     session.trades.push(trade);
   }
-  return { actions, sessions, trades };
+  const timeline = walkTimeline(actions, sessions, trades);
+  return { actions, sessions, trades, timeline };
+}
+
+// --- Outcome timing (behavior-0.3.0) -------------------------------------------
+//
+// Order on one trader's timeline: by time; at the same time, a settlement comes before a
+// placement ("the first trade placed at or after it"), and placements keep their action
+// order. A settlement without a later settled_at sits just after its own placement: after
+// it and before any later action, whatever their times (the behavior-0.2.0 rule). So does
+// the marker of a trade whose result is unavailable: the next trade then knows nothing
+// about it, as in behavior-0.2.0, unless a known outcome settles in between.
+
+function walkTimeline(actions, sessions, trades) {
+  const delayed = [];
+  const settlements = [];
+  const inline = new Map();
+  for (const trade of trades) {
+    const settlement = {
+      index: -1,
+      trade: trade.index,
+      outcome: trade.outcome,
+      result: trade.result,
+      basis: trade.result === null ? null : trade.settledMs === null ? 'assumed' : 'observed',
+      t: trade.result !== null && trade.settledMs !== null && trade.settledMs > trade.t ? trade.settledMs : trade.t,
+      session: null,
+      runCount: 0,
+      response: null,
+      latest: false
+    };
+    if (settlement.t > trade.t) delayed.push(settlement);
+    else inline.set(trade.index, settlement);
+    trade.settlementEvent = settlement;
+  }
+  delayed.sort((a, b) => a.t - b.t || a.trade - b.trade);
+
+  let pointer = 0;
+  let currentSession = null;
+  let running = 0;
+  let known = true;
+  let lossRun = 0;
+  let last = null;
+  let count = 0;
+  let pending = [];
+  const settle = (settlement) => {
+    settlement.index = settlements.length;
+    settlement.session = currentSession;
+    if (settlement.outcome === null) {
+      known = false;
+      lossRun = 0;
+    } else {
+      if (known) running += settlement.result;
+      lossRun = settlement.outcome === 'loss' ? lossRun + 1 : 0;
+    }
+    settlement.runCount = lossRun;
+    last = settlement;
+    count += 1;
+    pending.push(settlement);
+    settlements.push(settlement);
+  };
+  for (const action of actions) {
+    while (pointer < delayed.length && delayed[pointer].t <= action.t) settle(delayed[pointer++]);
+    if (action.session !== currentSession) {
+      currentSession = action.session;
+      running = 0;
+      known = true;
+      lossRun = 0;
+    }
+    if (!action.trade) continue;
+    const trade = action.trade;
+    trade.fresh = pending.length > 0;
+    trade.trigger = trade.fresh ? pending.at(-1) : null;
+    trade.superseded = Math.max(0, pending.length - 1);
+    if (trade.trigger) {
+      trade.trigger.response = trade.index;
+      trade.trigger.latest = true;
+    }
+    for (const earlier of pending.slice(0, -1)) earlier.response = trade.index;
+    pending = [];
+    trade.knownBefore = count;
+    trade.knownOutcome = last ? last.outcome : null;
+    const own = inline.get(trade.index);
+    if (own) settle(own);
+    trade.lossRunInSession = lossRun;
+    trade.runningRealized = known ? running : null;
+    trade.afterOutcome = last ? last.outcome : null;
+  }
+  while (pointer < delayed.length) settle(delayed[pointer++]);
+  for (const trade of trades) {
+    const settlement = trade.settlementEvent;
+    // Known before the next trade: the first trade placed after the settlement is the next one.
+    trade.settlement = settlement.basis
+      ? {
+        basis: settlement.basis,
+        at: settlement.t,
+        lagMinutes: (settlement.t - trade.t) / MINUTE_MS,
+        knownBeforeNextTrade: trades[trade.index + 1] ? settlement.response === trade.index + 1 : null
+      }
+      : null;
+  }
+  return { settlements, delayedCount: delayed.length };
 }
 
 // Net money moved into the account by a deposit (positive) or withdrawal (negative).
@@ -269,14 +402,16 @@ function balancePathAvailable(session) {
 }
 
 // Signal 3 state: the running result after each trade, relative to the session start.
-function computeRunningResults(sessions) {
+// A trader with a delayed settlement uses the realized path everywhere: a balance after a
+// trade can't say which open outcomes had landed in it.
+function computeRunningResults(sessions, settlementAware = false) {
   for (const session of sessions) {
     session.source = null;
     session.complete = false;
     session.maxDrawdown = null;
     if (!session.trades.length) continue;
 
-    if (balancePathAvailable(session)) {
+    if (!settlementAware && balancePathAvailable(session)) {
       session.source = 'balance';
       const reference = session.actions[0].event.balance_before;
       let netTransfers = 0;
@@ -285,15 +420,10 @@ function computeRunningResults(sessions) {
         else netTransfers += transferAmount(action.event);
       }
     } else {
+      // Settled results in settlement order (walkTimeline). A missing outcome makes the rest
+      // of the session unknown. It is never added as zero.
       session.source = 'realized_result';
-      let cumulative = 0;
-      let known = true;
-      for (const trade of session.trades) {
-        // A missing outcome makes the rest of the session unknown. It is never added as zero.
-        known = known && trade.result !== null;
-        if (known) cumulative += trade.result;
-        trade.running = known ? cumulative : null;
-      }
+      for (const trade of session.trades) trade.running = trade.runningRealized;
     }
 
     session.complete = session.trades.every((trade) => trade.running !== null);
@@ -339,26 +469,30 @@ function depositAmountOf(event) {
 // Signal 1: the trade after a realized loss or win, divided by the median of up to
 // rollingWindow previous usable stakes. A trade after the second or later loss of a
 // same-session losing run belongs to signal 6 instead (ADR-009).
+// The trigger is the latest outcome that settled since the trader's previous trade
+// (behavior-0.3.0); without settled_at it is the previous trade's outcome.
 function observePostOutcomeStake(trades, options) {
   const episodes = { loss: [], win: [] };
-  const excluded = { missingOutcome: 0, push: 0, missingStake: 0, insufficientHistory: 0, escalationPosition: 0 };
+  const excluded = { missingOutcome: 0, push: 0, missingStake: 0, insufficientHistory: 0, escalationPosition: 0, noNewOutcome: 0, superseded: 0 };
   const history = [];
 
   for (let index = 0; index < trades.length; index += 1) {
     const response = trades[index];
-    const trigger = trades[index - 1];
+    const trigger = response.trigger;
+    excluded.superseded += response.superseded;
+    if (index > 0 && !trigger) excluded.noNewOutcome += 1;
     if (trigger) {
       if (trigger.outcome === null) excluded.missingOutcome += 1;
       else if (trigger.outcome === 'push') excluded.push += 1;
       else if (response.stake === null) excluded.missingStake += 1;
-      else if (trigger.outcome === 'loss' && trigger.lossRunInSession >= 2 && response.session === trigger.session) {
+      else if (trigger.outcome === 'loss' && trigger.runCount >= 2 && response.session === trigger.session) {
         excluded.escalationPosition += 1; // used by signal 6 (ADR-009)
       } else {
         const prior = history.slice(-options.rollingWindow);
         if (prior.length < options.minStakeHistory) excluded.insufficientHistory += 1;
         else {
           const ratio = response.stake / median(prior);
-          episodes[trigger.outcome].push({ trigger: trigger.index, response: response.index, ratio, logRatio: Math.log(ratio) });
+          episodes[trigger.outcome].push({ trigger: trigger.trade, response: response.index, ratio, logRatio: Math.log(ratio) });
         }
       }
     }
@@ -367,21 +501,22 @@ function observePostOutcomeStake(trades, options) {
   return { ...episodes, excluded };
 }
 
-// Signal 2: minutes from a realized loss or win to the trader's next trade.
-function observeReentryLatency(trades) {
+// Signal 2: minutes from a realized loss or win becoming known to the first trade placed after it.
+function observeReentryLatency(trades, settlements) {
   const anySession = { loss: [], win: [] };
   const withinSession = { loss: [], win: [] };
-  const excluded = { missingOutcome: 0, push: 0, noNextTrade: 0 };
+  const excluded = { missingOutcome: 0, push: 0, noNextTrade: 0, superseded: 0 };
 
-  trades.forEach((trigger, index) => {
-    if (trigger.outcome === null) { excluded.missingOutcome += 1; return; }
-    if (trigger.outcome === 'push') { excluded.push += 1; return; }
-    const next = trades[index + 1];
-    if (!next) { excluded.noNextTrade += 1; return; }
+  for (const trigger of settlements) {
+    if (trigger.outcome === null) { excluded.missingOutcome += 1; continue; }
+    if (trigger.outcome === 'push') { excluded.push += 1; continue; }
+    if (trigger.response === null) { excluded.noNextTrade += 1; continue; }
+    if (!trigger.latest) { excluded.superseded += 1; continue; }
+    const next = trades[trigger.response];
     const minutes = (next.t - trigger.t) / MINUTE_MS;
     anySession[trigger.outcome].push(minutes);
     if (next.session === trigger.session) withinSession[trigger.outcome].push(minutes);
-  });
+  }
   return { anySession, withinSession, excluded };
 }
 
@@ -401,42 +536,75 @@ function refuelEpisode(trade, deposits, windowMs, observationEndMs) {
 
 // Signal 5, losing-streak trigger: the trade that completes K consecutive realized losses.
 // A refuel deposit, win, push, or missing outcome resets the count.
-function observeLosingStreaks(actions, trades, deposits, options, observationEndMs) {
+// The count runs over outcomes in settlement order, so the trigger is the settlement that
+// completes the streak, and the refuel window runs from its time (behavior-0.3.0).
+function observeLosingStreaks(actions, trades, settlements, deposits, options, observationEndMs) {
   const windowMs = options.refuelWindowMinutes * MINUTE_MS;
   const episodes = [];
   let streak = 0;
+  let pointer = 0;
+  const settled = (settlement) => {
+    streak = settlement.outcome === 'loss' ? streak + 1 : 0;
+    if (streak === options.losingStreakLength) {
+      const trade = trades[settlement.trade];
+      const inline = settlement.t === trade.t;
+      const censored = observationEndMs - settlement.t < windowMs;
+      episodes.push({
+        trade: trade.index,
+        t: settlement.t,
+        censored,
+        refueled: censored ? null : deposits.some((deposit) => deposit.refuel
+          && (inline ? deposit.action > trade.action.index : deposit.t >= settlement.t)
+          && deposit.t - settlement.t <= windowMs)
+      });
+    }
+  };
+  // Settlements in timeline order (walkTimeline): a delayed one comes before any action at or
+  // after its time; an immediate one comes right after its own trade.
+  const delayed = settlements.filter((settlement) => settlement.t > trades[settlement.trade].t);
   for (const action of actions) {
+    while (pointer < delayed.length && delayed[pointer].t <= action.t) settled(delayed[pointer++]);
     if (isRefuelDeposit(action)) { streak = 0; continue; }
     if (!action.trade) continue;
-    streak = action.trade.outcome === 'loss' ? streak + 1 : 0;
-    if (streak === options.losingStreakLength) {
-      episodes.push(refuelEpisode(trades[action.trade.index], deposits, windowMs, observationEndMs));
-    }
+    const own = action.trade.settlementEvent;
+    if (own && own.t === action.trade.t) settled(own);
   }
+  while (pointer < delayed.length) settled(delayed[pointer++]);
   return episodes;
 }
 
-// Signal 6: for each same-session run of 2+ realized losses, log(stake after loss m /
-// stake after loss 1) at step m - 1. Points from one run share `run` and `reference`.
-function observeEscalation(sessions) {
+// Signal 6: for each same-session run of 2+ realized losses (in settlement order), log(stake
+// on the first trade placed after loss m settled / the same after loss 1) at step m - 1.
+// Points from one run share `run` and `reference`.
+function observeEscalation(sessions, trades, settlements) {
   const points = [];
-  const excluded = { missingStake: 0, sessionEnded: 0 };
+  const excluded = { missingStake: 0, sessionEnded: 0, superseded: 0, missingReference: 0 };
   let runs = 0;
+  const bySession = sessions.map(() => []);
+  for (const settlement of settlements) if (settlement.session !== null) bySession[settlement.session].push(settlement);
 
   for (const session of sessions) {
-    const sessionTrades = session.trades;
+    const sequence = bySession[session.index];
+    // The first trade placed after this settlement, in this session, if it responds to it.
+    const responseTo = (settlement) => {
+      if (settlement.response === null || trades[settlement.response].session !== session.index) return { trade: null, reason: 'sessionEnded' };
+      if (!settlement.latest) return { trade: null, reason: 'superseded' };
+      return { trade: trades[settlement.response], reason: null };
+    };
     let start = 0;
-    while (start < sessionTrades.length) {
-      if (sessionTrades[start].outcome !== 'loss') { start += 1; continue; }
+    while (start < sequence.length) {
+      if (sequence[start].outcome !== 'loss') { start += 1; continue; }
       let length = 1;
-      while (start + length < sessionTrades.length && sessionTrades[start + length].outcome === 'loss') length += 1;
+      while (start + length < sequence.length && sequence[start + length].outcome === 'loss') length += 1;
 
       if (length >= 2) {
-        const reference = sessionTrades[start + 1]; // the trade after the first loss
+        const reference = responseTo(sequence[start]).trade; // the trade after the first loss
         let used = 0;
         for (let m = 2; m <= length; m += 1) {
-          const response = sessionTrades[start + m]; // the trade after the m-th loss
-          if (!response) excluded.sessionEnded += 1;
+          const answer = responseTo(sequence[start + m - 1]); // the trade after the m-th loss
+          const response = answer.trade;
+          if (!response) excluded[answer.reason] += 1;
+          else if (!reference) excluded.missingReference += 1;
           else if (reference.stake === null || response.stake === null) excluded.missingStake += 1;
           else {
             points.push({
@@ -469,21 +637,28 @@ function observedTrade(trade, previous, session, gapMs, observationEndMs) {
     result: trade.result,
     outcome: trade.outcome,
     first: !previous,
-    previousOutcome: previous ? previous.outcome : null,
+    // The latest outcome known when this trade was placed (behavior-0.3.0): without
+    // settled_at, the previous trade's outcome.
+    previousOutcome: trade.knownOutcome,
     lossRun: trade.lossRunInSession,
     running: trade.running,
     endsSession,
     // The data ends before we can tell whether this session would have continued.
     censored: endsSession && observationEndMs - session.endT < gapMs,
     balanceBefore: isFiniteNumber(event.balance_before) ? event.balance_before : null,
-    balanceAfter: isFiniteNumber(event.balance_after) ? event.balance_after : null
+    balanceAfter: isFiniteNumber(event.balance_after) ? event.balance_after : null,
+    // behavior-0.3.0 additions (BEHAVIOR_0_3_ADDITIONS).
+    afterOutcome: trade.afterOutcome,
+    knownBefore: trade.knownBefore,
+    fresh: trade.fresh,
+    settlement: trade.settlement
   };
 }
 
 function observeTrader(traderToken, group, options, observationEndMs) {
   const rows = [...group.rows].sort(compareRows);
-  const { actions, sessions, trades } = structure(rows, options);
-  computeRunningResults(sessions);
+  const { actions, sessions, trades, timeline } = structure(rows, options);
+  computeRunningResults(sessions, timeline.delayedCount > 0);
 
   const gapMs = options.sessionGapMinutes * MINUTE_MS;
   const observedTrades = trades.map((trade, index) => observedTrade(trade, trades[index - 1], sessions[trade.session], gapMs, observationEndMs));
@@ -507,7 +682,10 @@ function observeTrader(traderToken, group, options, observationEndMs) {
       withdrawalCount: actions.filter((action) => action.type === 'withdrawal').length,
       sessionCount: sessions.length,
       medianStake,
-      skippedInvalidTimestamps: group.invalidTimestamps
+      skippedInvalidTimestamps: group.invalidTimestamps,
+      tradesWithPlacedAt: group.placedAt,
+      tradesWithSettledAt: trades.filter((trade) => trade.settlement?.basis === 'observed').length,
+      settlementTimesBeforeTrade: group.settledBeforeTrade
     },
     sessions: sessions.map((session) => ({
       index: session.index,
@@ -522,9 +700,9 @@ function observeTrader(traderToken, group, options, observationEndMs) {
     trades: observedTrades,
     deposits,
     postOutcomeStake: observePostOutcomeStake(trades, options),
-    reentryLatency: observeReentryLatency(trades),
-    escalation: observeEscalation(sessions),
-    refuel: { losingStreak: observeLosingStreaks(actions, observedTrades, deposits, options, observationEndMs) }
+    reentryLatency: observeReentryLatency(trades, timeline.settlements),
+    escalation: observeEscalation(sessions, trades, timeline.settlements),
+    refuel: { losingStreak: observeLosingStreaks(actions, trades, timeline.settlements, deposits, options, observationEndMs) }
   };
 }
 
@@ -773,15 +951,25 @@ function observeAll(events, options, caller) {
   for (const event of Array.isArray(events) ? events : []) {
     if (!event || event.trader_token === undefined || event.trader_token === null || event.trader_token === '') continue;
     const token = String(event.trader_token);
-    if (!groups.has(token)) groups.set(token, { rows: [], invalidTimestamps: 0 });
+    if (!groups.has(token)) groups.set(token, { rows: [], invalidTimestamps: 0, placedAt: 0, settledBeforeTrade: 0 });
     const group = groups.get(token);
-    const t = Date.parse(event.occurred_at);
-    if (Number.isNaN(t)) {
+    const occurred = Date.parse(event.occurred_at);
+    if (Number.isNaN(occurred)) {
       group.invalidTimestamps += 1;
       continue;
     }
-    group.rows.push({ event, t });
-    if (latestEventMs === null || t > latestEventMs) latestEventMs = t;
+    // behavior-0.3.0: a trade's time is when the trader decided (placed_at) when known.
+    const placed = event.type === 'trade' && typeof event.placed_at === 'string' ? Date.parse(event.placed_at) : NaN;
+    const t = Number.isNaN(placed) ? occurred : placed;
+    const settled = event.type === 'trade' && typeof event.settled_at === 'string' ? Date.parse(event.settled_at) : NaN;
+    let settledMs = Number.isNaN(settled) ? null : settled;
+    if (settledMs !== null && settledMs < t) {
+      group.settledBeforeTrade += 1; // an outcome can't be known before the trade: assumed instead
+      settledMs = null;
+    }
+    if (!Number.isNaN(placed)) group.placedAt += 1;
+    group.rows.push({ event, t, settledMs });
+    if (latestEventMs === null || occurred > latestEventMs) latestEventMs = occurred;
   }
 
   const { resolved, observationEndMs } = resolveOptions(options, latestEventMs, caller);

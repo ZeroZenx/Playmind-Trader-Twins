@@ -66,8 +66,8 @@ test('dataLabel is required, validated, and carried into every output', () => {
     assert.equal(result.priors.dataLabel, label);
     assert.ok(result.twins.every((twin) => twin.dataLabel === label && twin.modelVersion === TWIN_MODEL_VERSION));
   }
-  assert.equal(fit.modelVersion, 'twin-0.2.1');
-  assert.equal(fit.behaviorVersion, 'behavior-0.2.0');
+  assert.equal(fit.modelVersion, 'twin-0.3.0');
+  assert.equal(fit.behaviorVersion, 'behavior-0.3.0');
 });
 
 test('market and contract fields are never read, and event order does not matter', () => {
@@ -97,8 +97,9 @@ test('every parameter has a status, n, and weight, and an estimate inside its in
     assert.ok(record.interval[0] <= record.estimate && record.estimate <= record.interval[1], name);
     if (record.status === 'prior_only') assert.equal(record.weight, 0, name);
   }
-  // With balances on every trade, no parameter in this population is not_estimable.
-  assert.ok(records(fit).every(([, record]) => record.status !== 'not_estimable'));
+  // With balances on every trade, no parameter in this population is not_estimable, except the
+  // settlement lag (twin-0.3.0), which needs settled_at.
+  assert.ok(records(fit).every(([name, record]) => record.status !== 'not_estimable' || name.startsWith('settlementLag')));
 });
 
 test('shrinkage follows the documented conjugate formulas', () => {

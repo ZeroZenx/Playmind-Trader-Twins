@@ -76,7 +76,7 @@ for (const path of ['balances', 'no-balances']) {
 test('the console summary names the versions, the label, and the verdict', () => {
   const summary = formatHoldoutSummary(results);
   assert.match(summary, /holdout-0\.1\.0 held-out validation \(SYNTHETIC\)/);
-  assert.match(summary, /twin-0\.2\.1 vs baseline-0\.1 and naive-0\.1/);
+  assert.match(summary, /twin-0.3.0 vs baseline-0\.1 and naive-0\.1/);
   assert.match(summary, /\[no-balances\] without balance fields: all-cause stop hazards, proxy \(losing-streak\) refuel/);
   const compared = results.runs['no-balances'].inputs.compared;
   assert.match(summary, new RegExp(`${compared} all-cause stops, ${compared} proxy refuel`));
