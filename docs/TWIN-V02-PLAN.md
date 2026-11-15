@@ -254,6 +254,60 @@ Then summarize the whole branch for a PR description to Darren.
 
 ---
 
+## Prompt 10 — Derive what the twin needs from raw data
+
+```
+Read CLAUDE.md, docs/TWIN-V02-PLAN.md, docs/DATA-DICTIONARY.md, docs/SPORTTRADE_INTAKE.md, docs/DECISIONS.md (ADR-009, ADR-012, ADR-014, ADR-016), docs/MODEL_CARD.md, src/intake/ (all files), src/engine/behavior.mjs, src/engine/estimate.mjs, src/engine/simulate.mjs, src/engine/holdout.mjs, analysis/polymarket_twin_extract.py, and analysis/README.md ("Twin test on Polymarket orders").
+
+Context: Sporttrade will send its raw export as-is. They won't clean it, add rows, or add fields for us. Everything the twin needs has to be derived internally from the fields they already have. The questions in docs/SPORTTRADE_INTAKE.md are clarifications of what their fields mean, not requests for new work.
+
+A first run of the twin on Polymarket public data (OBSERVATIONAL, Jan-Mar 2026, through npm run intake) found four gaps that will also apply to Sporttrade:
+- Outcome timing. behavior-0.2.0 assumes each trade's outcome is known before the trader's next trade. On Polymarket only about 18% of resolved orders had settled before the wallet's next order (Sports about 8%). Sporttrade is a sports exchange with in-play trading, so expect the same.
+- Fills vs orders. One order can appear as many fill rows. Treated as separate trades, they create fake rapid re-entries.
+- Decision time. A resting (maker) order's execution time is not when the trader decided.
+- No balances or deposits in the trade table, so refuel can't be estimated and stop hazards are all-cause.
+Intake today reads one file and maps each row to one event. It has no joins and no derived fields. analysis/polymarket_twin_extract.py did the derivation in Python outside intake, and its full 2,000-wallet run crashed when polars tried to allocate 1.6 TB on the join that pulls the sampled wallets' orders out of all 88 days of orders.
+
+Do the four parts in order. After each part, run npm run check, npm test, and npx tsc --noEmit, then commit that part on twin-v0.2. Never push.
+
+Part 1 — Multi-table intake and a derive stage (intake-0.2.0)
+1. Let the mapping config declare several source tables (for example trades, ledger, orders, markets), each with its own input file, source format, and column mapping, plus the keys that join them. Single-file configs must keep working unchanged: the existing fixture config and its tests pass without edits.
+2. Add a derive stage between map and validate: profile -> map (per table) -> derive -> validate -> readiness -> fit -> holdout -> sweep. Each derivation is a named, versioned method that the config selects per field, with an ordered list of fallbacks.
+3. Provenance: every derived field on every event records its source as observed, derived:<method>, or assumed. Keep it in a field the engine ignores, and make validateEvents accept it. The map report counts events per field per method. Readiness reports coverage per field by provenance.
+4. Raw files are never modified. Derive never prints a raw value: counts, field names, masked shapes, and tokens only, as now. Derivation is deterministic.
+5. ADR-017 in docs/DECISIONS.md, and update the config reference in docs/SPORTTRADE_INTAKE.md.
+
+Part 2 — Orders, outcome time, and results from raw tables, tested on Polymarket
+1. Order merging: merge legs or fills that share an order ID; otherwise, as a configured fallback, those with the same account, market, side, and timestamp. Stakes and results sum. Record how many rows merged.
+2. Decision time (placed_at): from an order-created column, joined to fills by order ID when an orders table exists. Otherwise use execution time, marked assumed.
+3. Outcome time (settled_at), methods in this order of preference, with whichever ones the config enables: the timestamp of the settlement posting in a ledger table joined to the trade by order or position ID; a settlement-time column on the trade row; the market's settlement or close time joined by market ID; the time of an opposite trade that closed the position. Otherwise leave it missing and marked assumed. Market tables stay optional (CLAUDE.md): the core path must work with none.
+4. Realized result methods: a signed P&L column; settlement credit minus debit; payout minus stake; and a contract-resolution method for binary contracts (price, quantity, side, and a winning flag; stake = amount at risk, result = hold-to-resolution P&L). The last one covers Polymarket and contract exchanges like Sporttrade. A result that can't be derived stays unavailable, never zero.
+5. Cut analysis/polymarket_twin_extract.py down to a converter. It screens and samples wallets as now (same retail screen, seed, and caps). It then filters each day's trades to the sampled wallets one file at a time, with no join across all days. It writes two raw tables under data/polymarket/: fills (one row per wallet side) and markets. Fill merging, stakes, results, and settled_at from close_time move into the intake mapping config and the derive stage. Keep the outcome-timing diagnostic, but compute it in readiness (Part 3) instead of in Python.
+
+Part 3 — Outcome timing in the engine (behavior-0.3.0, twin-0.3.0, simulator-0.3.0)
+1. Add optional settled_at (and placed_at) to the analytical event schema and docs/DATA-DICTIONARY.md.
+2. behavior-0.3.0: when settled_at is present, an outcome affects the first trade placed at or after it, not simply the next trade. Re-entry latency runs from settled_at. Session running result, losing streaks, and escalation runs update in settlement order at settlement time. A trade placed while earlier outcomes were still open reacts to what had settled by then. When settled_at is absent, results must equal behavior-0.2.0 exactly; add a test that proves it.
+3. Estimator: estimate a per-trader settlement-lag distribution when settled_at is present.
+4. Simulator: simulated trades settle after a lag drawn from that distribution, and simulated traders react only to settled outcomes. Without settled_at, behavior is unchanged.
+5. Readiness: report the share of resolved trades whose outcome was known before the trader's next trade, overall and by market type when present. Flag it when it is low. Never invent a threshold for "low" without documenting it.
+6. Synthetic: add a settlement-delay option to the behavioral generator and a recovery test showing the twin recovers chase and stop behavior with delays, using settled_at, and that it degrades without it.
+7. ADR-018, plus updates to docs/MODEL_CARD.md and the signal definitions in docs/DATA-DICTIONARY.md.
+
+Part 4 — Balance reconstruction from a cash ledger
+1. Derive balance_before and balance_after by replaying the full cash ledger per account (deposits − withdrawals − stakes + payouts − fees, as the config maps them), anchored to a balance snapshot when one exists, or to zero only when the config states the extract covers the account from opening.
+2. Where snapshots exist, check the replayed balance against them. Accounts whose drift exceeds a documented, configurable tolerance get no derived balances and are counted by reason. Never mix observed and derived balances within one account's session.
+3. Test it on the synthetic ledger fixture: remove its balances, reconstruct them, and compare to the generator's truth.
+4. Document it in ADR-019 and docs/SPORTTRADE_INTAKE.md.
+
+Then:
+1. Run the converter and npm run intake on Polymarket, 2,000 wallets, twice: settled_at derived from close_time, and settled_at disabled (the behavior-0.2.0 assumption). Write a short comparison (eligibility, which holdout checks pass, calibration coverage, outcome-timing share, and provenance coverage) to analysis/output/polymarket-twin/ (gitignored). Label it OBSERVATIONAL. No AUC-style headline. Keep it within the intake scale from Prompt 9 (about 700k rows); if the heap runs short, say so and lower the cap rather than raising the heap silently.
+2. Re-run the intake fixture end to end and npm run verify:release.
+3. Reword the open questions in docs/SPORTTRADE_INTAKE.md and docs/SPORTTRADE_READINESS.md as clarifications of existing fields. Readiness is no longer "the ask list": it reports which derivation methods worked and what had to be assumed. Update docs/IMPLEMENTATION_STATUS.md.
+4. Add every new .mjs module to npm run check. Show me git status and confirm nothing under data/, .data/, or analysis/output/ is staged.
+```
+
+---
+
 ## Definition of "ready for Sporttrade's data"
 
 - The pipeline runs end to end on a fixture shaped like an exchange ledger, with no market fields.
