@@ -155,6 +155,22 @@ Derive methods (intake-derive-0.1.0). Parameters that name attributes refer to a
 | `realized_result` | `signed-pnl` 0.1 | `column` (number), `perspective` (`trader` default, or `house`) | the signed P&L column |
 | `realized_result` | `credit-minus-debit` 0.1 | `credit`, `debit` (numbers) | credit minus abs(debit); both blank is unavailable |
 | `realized_result` | `payout-minus-stake` 0.1 | `payout` (number) | payout minus the event's stake; either unknown is unavailable |
+| `realized_result` | `contract-resolution` 0.1 | `price`, `quantity` (numbers), `side` (key), `buy`, `sell` (side values; default `buy`, `sell`), `won` (boolean), `priceScale` (default 1; 100 for prices in cents), `contractValue` (what a winning contract pays, default 1) | the hold-to-resolution P&L of a binary contract: a buy wins (1 - p) q or loses p q; a sell the reverse. `won` blank (unresolved) is unavailable |
+| `stake_amount` | `contract-resolution` 0.1 | as above, without `won` | the amount at risk: p q for a buy, (1 - p) q for a sell |
+| `orders` | `order-id` 0.1 | `key` (a key attribute, or a list that together identify the order) | merges one trader's rows that share an order ID |
+| `orders` | `account-market-side-time` 0.1 | `market`, `side` (keys) | fallback: merges one trader's rows with the same market, side, and timestamp |
+| `placed_at` | `order-created` 0.1 | `attribute` (a timestamp on the trade row), or `join` and `joinAttribute` (a timestamp on an orders table) | the order-creation time; a time after the execution time is skipped |
+| `settled_at` | `ledger-settlement` 0.1 | `join` (into a ledger events table, by order or position ID), `kind` and `kinds` (which postings mean settlement) | the latest matching posting's time |
+| `settled_at` | `trade-settlement-column` 0.1 | `attribute` (a timestamp on the trade row) | that time |
+| `settled_at` | `market-settlement` 0.1 | `join` (into a market table), `attribute` (its settlement or close time) | that time |
+| `settled_at` | `closing-trade` 0.1 | `market`, `side` (keys), `contract` (key, optional), `quantity` (number, optional), `buy`, `sell` | the time of the opposite trade that closed the position, first in first out by quantity |
+
+How the methods combine:
+
+- **Orders first.** `orders` methods run in order, and the first that gives a key groups the row. Within an order, stakes, results, payouts, and quantities sum, the price is quantity-weighted, the decision time is the earliest, and the outcome time the latest. If any part's result is unavailable, so is the order's. `map-report.json` reports rows in, orders out, and rows merged per method under `derive.orders`.
+- **Outcome time in a fixed order of preference**: `ledger-settlement`, `trade-settlement-column`, `market-settlement`, `closing-trade`. List the ones the export supports, in that order; a list out of order is refused. A time before the trade is skipped and counted, and the next method is tried. An outcome time is kept only on a trade with a result. `closing-trade` runs after orders are merged, and only gives a time to the trade it closes, not to the closing trade. Pair it with a result method that realizes at close; with `contract-resolution` (hold to resolution) the outcome would be early.
+- **Market tables are optional.** With only a trades table the core path works: the decision time and the outcome time are then assumed.
+- Join hits are counted per join under `derive.joins` (`looked` is rows with a key, `found` is rows the join matched). Skips and merge problems are counted under `derive.notes`.
 
 Every event carries `provenance`: for each derivable field (`stake_amount`, `realized_result`, `placed_at`, `settled_at`, `balance_before`, `balance_after`) that applies to its type, `observed`, `derived:<method>-<version>`, or `assumed`. `placed_at` is assumed when no method gives a decision time (the execution time is used), and `settled_at` when no method gives an outcome time for a trade with a result (the outcome is taken as known before the next trade). A field with no entry is unavailable. `map-report.json` counts events per field per source under `derive.byField`, `npm run intake -- map` prints the counts, and `readiness.md` shows them in "Where derived fields came from".
 

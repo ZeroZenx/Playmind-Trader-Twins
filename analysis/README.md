@@ -68,3 +68,31 @@ POLARS_MAX_THREADS=4 ./.venv/bin/python analysis/polymarket_holdout_model.py
 The model trains on 2024-2025 loss episodes and evaluates Jan 1 through Mar 29, 2026. It uses a frozen 2024-2025 wallet baseline and a transparent logistic model. The holdout evaluation exists and its results are kept in local output (`analysis/output/`, gitignored). It concerns a public-data behavioral proxy, not a causal or clinical claim.
 
 The download script targets [vgregoire/polymarket-users](https://huggingface.co/datasets/vgregoire/polymarket-users) only. It does not target the separate raw-trades dataset.
+
+## Twin test on Polymarket orders (OBSERVATIONAL)
+
+This runs the trader twin (estimation, held-out validation, policy sweep) on real Polymarket wallets through the same `npm run intake` path that customer data uses. Everything it writes is labeled OBSERVATIONAL and stays in gitignored folders (`.data/`, `data/`).
+
+```bash
+./.venv/bin/python analysis/download_holdout.py --kind trades --workers 6   # ~18 GB, 88 day files
+curl -L "https://huggingface.co/datasets/vgregoire/polymarket-users/resolve/main/markets.parquet?download=true" \
+  -o .data/polymarket-meta/markets.parquet
+POLARS_MAX_THREADS=6 ./.venv/bin/python analysis/polymarket_twin_extract.py
+npm run intake -- run --config data/polymarket/mapping.json --label OBSERVATIONAL
+npm run intake -- run --config data/polymarket/mapping-no-settlement.json --label OBSERVATIONAL
+```
+
+`analysis/polymarket_twin_extract.py` (version 0.2.0) is a converter. It applies the retail screen from the loss-chasing analysis (computed on orders inside the window) and takes a deterministic sample of 2,000 wallets, capped at 700,000 orders, with the same seed and caps as before. Then it filters each day's trades to the sampled wallets one file at a time, with no join across days, and writes two raw tables under `data/polymarket/raw/`: `fills.csv` (one row per wallet side of a fill) and `markets.csv` (market close times). Its docstring defines the screen, the sample, and the columns.
+
+Everything the twin needs from those tables is derived by intake (ADR-017), from the mapping configs the converter writes next to them:
+
+- **Orders.** Fills that share a transaction, token, role, and side are one order (`order-id`). Stakes and results sum.
+- **Stake and result.** `contract-resolution`: the stake is the amount at risk, and the result is the hold-to-resolution P&L. It stays unavailable when the market had not resolved by the dataset end.
+- **Outcome time.** `mapping.json` derives `settled_at` from the market's close time (`market-settlement`). `mapping-no-settlement.json` leaves it out, so every outcome is assumed known before the next trade (the behavior-0.2.0 assumption).
+
+What this data still can't give the twin:
+
+- **Decision time.** There is no order-creation time, so a maker order's time is when it filled. `placed_at` is assumed.
+- **Deposits and balances.** The dataset has no deposits, withdrawals, or balances. Stop hazards are all-cause and refuel is not estimable.
+
+Intake readiness reports the outcome-timing share (ADR-018): of resolved trades, how many settled before the wallet's next trade, overall and by category. `readiness.md` also says which derivation methods worked and what had to be assumed.

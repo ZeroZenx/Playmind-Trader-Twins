@@ -74,6 +74,9 @@ function round8(value) {
 const RESULT = 'realized_result';
 const STAKE = 'stake_amount';
 
+/** Fields whose method lists must follow a fixed order of preference (ADR-017, ADR-018). */
+export const METHOD_ORDER = {};
+
 export const METHODS = {
   [RESULT]: {
     'signed-pnl': {
@@ -110,7 +113,194 @@ export const METHODS = {
   },
   [STAKE]: {},
   placed_at: {},
-  settled_at: {}
+  settled_at: {},
+  orders: {}
+};
+
+// --- Binary contracts --------------------------------------------------------------------------------
+//
+// A contract pays contractValue (default 1, in currency) if it wins and 0 if it loses; its
+// price is price / priceScale of that (priceScale 100 for prices in cents of a 1-unit
+// contract). A buy at price p for quantity q risks p q and wins (1 - p) q; a sell (writing the
+// contract, or selling it short) risks (1 - p) q and wins p q. The result is the hold-to-resolution P&L:
+// what the order made if held until the contract resolved. Summed over a trader's orders it is
+// their P&L on those contracts, whatever closed them in between.
+
+const CONTRACT_PARAMS = {
+  price: { kind: 'number', required: true },
+  quantity: { kind: 'number', required: true },
+  side: { kind: 'key', required: true },
+  buy: { kind: 'strings', default: ['buy'] },
+  sell: { kind: 'strings', default: ['sell'] },
+  priceScale: { kind: 'positive', default: 1 },
+  contractValue: { kind: 'positive', default: 1 }
+};
+
+function contractTerms(attributes, params) {
+  const price = attributes[params.price];
+  const quantity = attributes[params.quantity];
+  const side = attributes[params.side];
+  if (!isFiniteNumber(price) || !isFiniteNumber(quantity) || side === null || side === undefined) return null;
+  const p = price / params.priceScale;
+  if (!(p >= 0 && p <= 1) || !(quantity > 0)) return null;
+  const folded = String(side).toLowerCase();
+  const buy = params.buy.some((value) => value.toLowerCase() === folded);
+  const sell = params.sell.some((value) => value.toLowerCase() === folded);
+  if (buy === sell) return null;
+  return { buy, cost: p * quantity * params.contractValue, payoff: quantity * params.contractValue };
+}
+
+METHODS[STAKE]['contract-resolution'] = {
+  version: '0.1',
+  description: 'Binary contract: the amount at risk, price x quantity for a buy, (1 - price) x quantity for a sell.',
+  params: CONTRACT_PARAMS,
+  apply({ attributes }, params) {
+    const terms = contractTerms(attributes, params);
+    if (!terms) return null;
+    return round8(terms.buy ? terms.cost : terms.payoff - terms.cost);
+  }
+};
+
+METHODS[RESULT]['contract-resolution'] = {
+  version: '0.1',
+  description: 'Binary contract: the hold-to-resolution P&L from price, quantity, side, and whether the contract won. An unresolved contract (won blank) is unavailable.',
+  params: { ...CONTRACT_PARAMS, won: { kind: 'boolean', required: true } },
+  apply({ attributes }, params) {
+    const terms = contractTerms(attributes, params);
+    const won = attributes[params.won];
+    if (!terms || typeof won !== 'boolean') return null;
+    const buyResult = won ? terms.payoff - terms.cost : -terms.cost;
+    return round8(terms.buy ? buyResult : -buyResult);
+  }
+};
+
+// --- Joins ------------------------------------------------------------------------------------------
+
+function joinKey(trader, key) {
+  return `${trader}\u0000${key}`;
+}
+
+/** The rows a join finds for one record: [] when the key is blank or nothing matches. */
+function joined(record, joinName, context) {
+  const join = context.config.joins[joinName];
+  const key = record.attributes[join.from.attribute];
+  const stats = context.joinStats[joinName] ??= { looked: 0, found: 0 };
+  if (key === null || key === undefined) return [];
+  stats.looked += 1;
+  let index = context.joinIndexes.get(joinName);
+  if (!index) {
+    index = new Map();
+    const target = context.tables[join.to.table];
+    for (const row of target.rows ?? []) {
+      const value = row.attributes[join.to.attribute];
+      if (value === null || value === undefined) continue;
+      const id = join.sameTrader ? joinKey(row.traderToken, value) : value;
+      if (!index.has(id)) index.set(id, []);
+      index.get(id).push(row);
+    }
+    context.joinIndexes.set(joinName, index);
+  }
+  const rows = index.get(join.sameTrader ? joinKey(record.event.trader_token, key) : key) ?? [];
+  if (rows.length) stats.found += 1;
+  return rows;
+}
+
+// --- Decision time -------------------------------------------------------------------------------------
+
+METHODS.placed_at['order-created'] = {
+  version: '0.1',
+  description: 'The order-creation time: a timestamp attribute on the trade row, or one on an orders table joined by order ID (the earliest when several rows match).',
+  params: { attribute: { kind: 'timestamp' }, join: { kind: 'join' }, joinAttribute: { kind: 'joined:timestamp' } },
+  check(params, where) {
+    if ((params.attribute === null) === (params.join === null)) throw configError(`${where} needs attribute (on the trade row) or join and joinAttribute (on an orders table), not both.`);
+    if (params.join !== null && params.joinAttribute === null) throw configError(`${where}.joinAttribute is required with join.`);
+  },
+  apply(record, params, context) {
+    if (params.attribute !== null) return record.attributes[params.attribute] ?? null;
+    const times = joined(record, params.join, context).map((row) => row.attributes[params.joinAttribute]).filter(isFiniteNumber);
+    return times.length ? Math.min(...times) : null;
+  }
+};
+
+// --- Outcome time ------------------------------------------------------------------------------------
+
+METHODS.settled_at['ledger-settlement'] = {
+  version: '0.1',
+  description: 'The time of the settlement posting in a ledger table joined to the trade by order or position ID: the latest matching posting, so a trade settled in parts counts as settled when the last part posts.',
+  params: { join: { kind: 'join', required: true }, kind: { kind: 'joined:key' }, kinds: { kind: 'strings' } },
+  check(params, where, config) {
+    if (config.tables[config.joins[params.join].to.table].role !== 'events') throw configError(`${where}.join must lead to a ledger table with role "events" (its rows carry posting times).`);
+    if ((params.kind === null) !== (params.kinds === null)) throw configError(`${where}: kind and kinds go together (the attribute that says what a posting is, and the values that mean settlement).`);
+  },
+  apply(record, params, context) {
+    const wanted = params.kinds ? new Set(params.kinds.map((value) => value.toLowerCase())) : null;
+    const times = joined(record, params.join, context)
+      .filter((row) => !wanted || wanted.has(String(row.attributes[params.kind] ?? '').toLowerCase()))
+      .map((row) => row.ms);
+    return times.length ? Math.max(...times) : null;
+  }
+};
+
+METHODS.settled_at['trade-settlement-column'] = {
+  version: '0.1',
+  description: 'A settlement-time timestamp attribute on the trade row.',
+  params: { attribute: { kind: 'timestamp', required: true } },
+  apply({ attributes }, params) {
+    return attributes[params.attribute] ?? null;
+  }
+};
+
+METHODS.settled_at['market-settlement'] = {
+  version: '0.1',
+  description: 'The market\'s settlement or close time, from a market table joined by market ID.',
+  params: { join: { kind: 'join', required: true }, attribute: { kind: 'joined:timestamp', required: true } },
+  apply(record, params, context) {
+    const [row] = joined(record, params.join, context);
+    return row ? row.attributes[params.attribute] ?? null : null;
+  }
+};
+
+METHODS.settled_at['closing-trade'] = {
+  version: '0.1',
+  description: 'The time of the opposite trade that closed the position: same trader and market (and contract, when given), first in first out by quantity (one unit per trade without a quantity). Runs after order merging.',
+  params: {
+    market: { kind: 'key', required: true },
+    side: { kind: 'key', required: true },
+    contract: { kind: 'key' },
+    quantity: { kind: 'number' },
+    buy: { kind: 'strings', default: ['buy'] },
+    sell: { kind: 'strings', default: ['sell'] }
+  },
+  // Positions need every trade at once, so this method runs in its own pass (closingTrades).
+  apply() {
+    return null;
+  }
+};
+
+METHOD_ORDER.settled_at = ['ledger-settlement', 'trade-settlement-column', 'market-settlement', 'closing-trade'];
+
+// --- Orders --------------------------------------------------------------------------------------
+
+METHODS.orders['order-id'] = {
+  version: '0.1',
+  description: 'Merge the legs or fills of one trader that share an order ID (one attribute, or several that together identify the order).',
+  params: { key: { kind: 'key', required: true, list: true } },
+  apply({ attributes }, params) {
+    const keys = Array.isArray(params.key) ? params.key : [params.key];
+    const values = keys.map((name) => attributes[name]);
+    return values.some((value) => value === null || value === undefined) ? null : values.join('\u0000');
+  }
+};
+
+METHODS.orders['account-market-side-time'] = {
+  version: '0.1',
+  description: 'Merge fills of one trader with the same market, side, and timestamp. A fallback for rows without an order ID.',
+  params: { market: { kind: 'key', required: true }, side: { kind: 'key', required: true } },
+  apply({ attributes, event }, params) {
+    const market = attributes[params.market];
+    const side = attributes[params.side];
+    return market === null || market === undefined || side === null || side === undefined ? null : `${market}\u0000${side}\u0000${event.occurred_at}`;
+  }
 };
 
 /** The provenance label of a method: derived:<name>-<version>. */
@@ -204,9 +394,6 @@ function normalizeParams(field, name, entry, where, config) {
   return { field, name, version: spec.version, label: methodLabel(field, name), tables, params };
 }
 
-/** Fields whose method lists must follow a fixed order of preference (ADR-017). */
-export const METHOD_ORDER = {};
-
 /**
  * Checks the config's derive section and returns { [field]: [method entries] }. A field
  * without a list keeps only its mapped (observed) value. Throws an IntakeError naming the
@@ -274,17 +461,171 @@ function firstValue(field, record, methods, context) {
   return null;
 }
 
+// A time method's value must not come before the trade: an order is created at or before its
+// first fill, and an outcome is known at or after it. A value that breaks this is skipped, the
+// next method is tried, and the skip is counted.
+function firstTime(field, record, methods, context, notes) {
+  const executed = eventTime(record.event);
+  for (const method of methods) {
+    if (!method.tables.includes(record.table) || method.name === 'closing-trade') continue;
+    const value = METHODS[field][method.name].apply(record, method.params, context);
+    if (!isFiniteNumber(value)) continue;
+    if (field === 'placed_at' ? value > executed : value < executed) {
+      notes.add(field, `${method.label}: ${field === 'placed_at' ? 'after the execution time' : 'before the trade'}, skipped`);
+      continue;
+    }
+    return { value, label: method.label };
+  }
+  return null;
+}
+
+// One provenance for a merged order: assumed if any part was assumed; otherwise the first
+// derived method among the parts; observed only if every part was observed.
+function mergedSource(labels) {
+  const present = labels.filter(Boolean);
+  if (!present.length) return null;
+  if (present.includes(ASSUMED)) return ASSUMED;
+  return present.find((label) => label !== OBSERVED) ?? OBSERVED;
+}
+
+const SUMMED_FIELDS = [STAKE, RESULT, 'payout_amount', 'quantity'];
+const SHARED_TEXT_FIELDS = ['market_id', 'market_type', 'side'];
+
+function mergeGroup(group, notes) {
+  const [first] = group;
+  if (group.length === 1) return first;
+  const event = { ...first.event };
+  const provenance = {};
+  for (const field of SUMMED_FIELDS) {
+    if (!group.some((record) => record.event[field] !== undefined)) continue;
+    const values = group.map((record) => record.event[field]);
+    if (values.every(isFiniteNumber)) {
+      event[field] = round8(values.reduce((total, value) => total + value, 0));
+      if (field === STAKE || field === RESULT) provenance[field] = mergedSource(group.map((record) => record.provenance[field]));
+    } else {
+      event[field] = null; // one unknown part makes the order's total unavailable, never 0
+      if (field === RESULT) notes.add('orders', 'merged order with a part whose result is unavailable: result unavailable');
+      if (field === STAKE) notes.add('orders', 'merged order with a part whose stake is unavailable: stake unavailable');
+    }
+  }
+  if (group.every((record) => isFiniteNumber(record.event.price) && isFiniteNumber(record.event.quantity)) && event.quantity > 0) {
+    event.price = round8(group.reduce((total, record) => total + record.event.price * record.event.quantity, 0) / event.quantity);
+  }
+  for (const field of SHARED_TEXT_FIELDS) {
+    if (new Set(group.map((record) => record.event[field] ?? null)).size > 1) notes.add('orders', `merged rows disagree on ${field}: the first row's value is kept`);
+  }
+  const placed = group.map((record) => record.times.placed_at).filter(Boolean);
+  const settled = group.map((record) => record.times.settled_at).filter(Boolean);
+  const times = {};
+  if (placed.length === group.length) times.placed_at = { value: Math.min(...placed.map((item) => item.value)), label: mergedSource(placed.map((item) => item.label)) };
+  // The order's outcome is known when its last part settles; if any part's time is unknown, so is the order's.
+  if (settled.length === group.length) times.settled_at = { value: Math.max(...settled.map((item) => item.value)), label: mergedSource(settled.map((item) => item.label)) };
+  const sums = {};
+  for (const [name, value] of Object.entries(first.attributes)) {
+    if (isFiniteNumber(value) && group.every((record) => isFiniteNumber(record.attributes[name]))) sums[name] = group.reduce((total, record) => total + record.attributes[name], 0);
+  }
+  return { ...first, event, provenance, times, rows: group.length, sums };
+}
+
+/** Groups trades into orders with the configured methods, in order: the first that gives a key wins. */
+function mergeOrders(records, methods, counts, notes) {
+  if (!methods.length) return records;
+  const groups = new Map();
+  const output = [];
+  for (const record of records) {
+    let key = null;
+    if (record.event.type === 'trade') {
+      for (const method of methods) {
+        if (!method.tables.includes(record.table)) continue;
+        const value = METHODS.orders[method.name].apply(record, method.params);
+        if (value !== null) {
+          key = `${method.name}\u0000${record.table}\u0000${record.event.trader_token}\u0000${value}`;
+          record.groupMethod = method.label;
+          break;
+        }
+      }
+    }
+    if (key === null) {
+      output.push([record]);
+      continue;
+    }
+    let group = groups.get(key);
+    if (!group) {
+      group = [];
+      groups.set(key, group);
+      output.push(group);
+    }
+    group.push(record);
+  }
+  const merged = [];
+  for (const group of output) {
+    const record = mergeGroup(group, notes);
+    if (group.length > 1) {
+      counts.add('orders', group[0].groupMethod, 1);
+      counts.add('rowsMerged', group[0].groupMethod, group.length - 1);
+    }
+    merged.push(record);
+  }
+  return merged;
+}
+
+/** closing-trade: FIFO lots per trader, market, and contract; a fully closed lot settles at the closing trade. */
+function closingTrades(records, method, notes) {
+  const { params } = method;
+  const buys = new Set(params.buy.map((value) => value.toLowerCase()));
+  const sells = new Set(params.sell.map((value) => value.toLowerCase()));
+  const positions = new Map();
+  for (const record of records) {
+    if (record.event.type !== 'trade' || !method.tables.includes(record.table)) continue;
+    const market = record.attributes[params.market];
+    const side = String(record.attributes[params.side] ?? '').toLowerCase();
+    const isBuy = buys.has(side);
+    if (market === null || market === undefined || isBuy === sells.has(side)) continue;
+    const contract = params.contract ? record.attributes[params.contract] ?? '' : '';
+    const key = `${record.event.trader_token}\u0000${market}\u0000${contract}`;
+    let position = positions.get(key);
+    if (!position) {
+      position = { buy: [], sell: [] };
+      positions.set(key, position);
+    }
+    const quantity = params.quantity ? record.sums?.[params.quantity] ?? record.attributes[params.quantity] : 1;
+    if (!isFiniteNumber(quantity) || quantity <= 0) continue;
+    let remaining = quantity;
+    const opposite = position[isBuy ? 'sell' : 'buy'];
+    const time = eventTime(record.event);
+    while (remaining > 1e-12 && opposite.length) {
+      const lot = opposite[0];
+      const take = Math.min(lot.remaining, remaining);
+      lot.remaining -= take;
+      remaining -= take;
+      if (lot.remaining <= 1e-12) {
+        opposite.shift();
+        if (!lot.record.times.settled_at && time >= eventTime(lot.record.event)) {
+          lot.record.times.settled_at = { value: time, label: method.label };
+          notes.add('settled_at', `${method.label}: lots closed by an opposite trade`);
+        }
+      }
+    }
+    if (remaining > 1e-12) position[isBuy ? 'buy' : 'sell'].push({ record, remaining });
+  }
+}
+
 /**
  * Derives fields on mapped events. input: { config (normalizeIntakeConfig output), tables:
  * { [name]: { role: 'events', events, attributes (WeakMap event -> attributes), rows } |
  * { role: 'lookup', rows } } }. Returns { events, report }. The mapped events are not
  * modified: every output event is a new object.
+ *
+ * Order: stake and result per row; decision and outcome times per row; order merging (stakes
+ * and results sum, the earliest decision time and the latest outcome time); closing-trade
+ * outcome times; then provenance. An outcome time is kept only on a trade with a result.
  */
 export function deriveEvents({ config, tables }) {
   const counter = new Counter();
   const notes = new Counter();
+  const merges = new Counter();
   const tableNames = Object.keys(config.tables);
-  const records = [];
+  let records = [];
   for (const [name, table] of Object.entries(tables)) {
     if (table.role !== 'events') continue;
     const mapping = config.tables[name].mapping;
@@ -295,12 +636,14 @@ export function deriveEvents({ config, tables }) {
         event: { ...event },
         attributes: table.attributes?.get(event) ?? {},
         provenance: {},
+        times: {},
+        rows: 1,
         mapping
       });
     }
   }
   records.sort(compareEvents);
-  const context = { config, tables };
+  const context = { config, tables, joinIndexes: new Map(), joinStats: {} };
 
   for (const record of records) {
     const { event } = record;
@@ -319,14 +662,37 @@ export function deriveEvents({ config, tables }) {
         event[field] = null; // unavailable, never 0
       }
     }
+    for (const field of ['placed_at', 'settled_at']) {
+      const found = firstTime(field, record, config.derive[field], context, notes);
+      if (found) record.times[field] = found;
+    }
   }
+
+  const rowsIn = records.length;
+  records = mergeOrders(records, config.derive.orders, merges, notes);
+  const closing = config.derive.settled_at.find((method) => method.name === 'closing-trade');
+  if (closing) closingTrades(records, closing, notes);
 
   const events = [];
   for (const record of records) {
-    const { event, provenance } = record;
+    const { event, provenance, times } = record;
     if (event.type === 'trade') {
-      provenance.placed_at ??= ASSUMED;
-      if (isFiniteNumber(event.realized_result) && !event.settled_at) provenance.settled_at ??= ASSUMED;
+      if (times.placed_at && times.placed_at.label !== ASSUMED) {
+        event.placed_at = new Date(times.placed_at.value).toISOString();
+        provenance.placed_at = times.placed_at.label;
+      } else {
+        provenance.placed_at = ASSUMED;
+      }
+      if (isFiniteNumber(event.realized_result)) {
+        if (times.settled_at && times.settled_at.label !== ASSUMED) {
+          event.settled_at = new Date(times.settled_at.value).toISOString();
+          provenance.settled_at = times.settled_at.label;
+        } else {
+          provenance.settled_at = ASSUMED;
+        }
+      } else if (times.settled_at) {
+        notes.add('settled_at', 'outcome time found for a trade with no result: not kept');
+      }
     }
     for (const field of ['balance_before', 'balance_after']) {
       if (isFiniteNumber(event[field]) && !provenance[field] && PROVENANCE_SCOPE[field].includes(event.type)) provenance[field] = OBSERVED;
@@ -339,13 +705,18 @@ export function deriveEvents({ config, tables }) {
     if (Object.keys(ordered).length) event[PROVENANCE_FIELD] = ordered;
     events.push(event);
   }
+  events.sort((a, b) => (a.occurred_at < b.occurred_at ? -1 : a.occurred_at > b.occurred_at ? 1 : a.source_row_number - b.source_row_number));
 
   return {
     events,
     report: {
       deriveVersion: DERIVE_VERSION,
-      methods: Object.fromEntries(Object.entries(config.derive).filter(([, list]) => list.length).map(([field, list]) => [field, list.map((method) => method.label)])),
+      methods: Object.fromEntries(Object.entries(config.derive).filter(([, list]) => Array.isArray(list) && list.length).map(([field, list]) => [field, list.map((method) => method.label)])),
       byField: counter.counts,
+      orders: config.derive.orders.length
+        ? { rowsIn, eventsOut: records.length, ordersMerged: merges.counts.orders ?? {}, rowsMergedAway: merges.counts.rowsMerged ?? {} }
+        : null,
+      joins: context.joinStats,
       assumptions: ASSUMPTIONS,
       notes: notes.counts,
       note: 'Events per derivable field by source: observed (a mapped column), derived:<method> (the first configured method that gave a value), assumed (the engine default), or unavailable. Counts only, never values.'
