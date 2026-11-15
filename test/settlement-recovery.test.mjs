@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { buildBehaviorObservations } from '../src/engine/behavior.mjs';
 import { estimateTwins } from '../src/engine/estimate.mjs';
-import { simulateTwinV2 } from '../src/engine/simulate.mjs';
+import { SETTLEMENT_RULES, simulateTwinV2 } from '../src/engine/simulate.mjs';
 import { generateBehavioralDataset } from '../src/synthetic/behavioral-generate.mjs';
 import { assessReadiness, OUTCOME_TIMING_LOW_SHARE, renderReadinessMarkdown } from '../src/intake/readiness.mjs';
 
@@ -111,4 +111,29 @@ test('readiness reports the outcome-timing share, overall and by market type, an
   assert.equal(untested.share, null);
   assert.equal(untested.low, false);
   assert.match(untested.note, /untested/);
+});
+
+test('a long-tailed settlement lag stays a valid time: simulated lags are capped at SETTLEMENT_RULES.maxLagDays', () => {
+  // Without the cap, a lag median of 10 million minutes with a log SD of 4 draws lags past the
+  // largest valid date, and the run throws (the OBSERVATIONAL Polymarket run found this).
+  const fit = structuredClone(withFit);
+  for (const twin of fit.twins) {
+    twin.parameters.settlementLagMinutes.estimate = 1e7;
+    twin.parameters.settlementLagMinutes.posterior.mean = Math.log(1e7);
+    twin.parameters.settlementLagSpread.estimate = 4;
+    twin.parameters.settlementLagSpread.posterior.mean = Math.log(4);
+  }
+  const run = simulateTwinV2(fit, { traders: fit.twins.slice(0, 4).map((twin) => twin.traderToken), replicates: 5, sessions: 10, uncertainty: false, keepEvents: true, seed: 3 });
+  const maxMs = SETTLEMENT_RULES.maxLagDays * 86400000;
+  let capped = 0;
+  for (const trader of run.traders) {
+    for (const replicate of trader.runs) {
+      for (const event of replicate.events.filter((item) => item.type === 'trade')) {
+        const lag = Date.parse(event.settled_at) - Date.parse(event.occurred_at);
+        assert.ok(lag >= 0 && lag <= maxMs);
+        if (lag === maxMs) capped += 1;
+      }
+    }
+  }
+  assert.ok(capped > 0, 'the cap binds on this long tail');
 });

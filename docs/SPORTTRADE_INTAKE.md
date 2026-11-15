@@ -1,6 +1,6 @@
 # Sporttrade intake
 
-How to take Sporttrade's historical export from a raw file to a twin evidence report, which fields we need, and what we still have to ask them. The pipeline is `npm run intake` (`scripts/intake.mjs`, version `intake-0.2.0`). Its logic is in `src/intake/`, and the decisions behind it are in ADR-016 and ADR-017 (`docs/DECISIONS.md`).
+How to take Sporttrade's historical export from a raw file to a twin evidence report, which fields we need, and what we still need to understand about the fields they send. The pipeline is `npm run intake` (`scripts/intake.mjs`, version `intake-0.2.0`). Its logic is in `src/intake/`, and the decisions behind it are in ADR-016 and ADR-017 (`docs/DECISIONS.md`).
 
 The file is CUSTOMER data. It, the mapping config written for it, and every output stay under `data/` (gitignored) or outside the repo. Nothing in this repo holds a Sporttrade value, field list with real values, or result.
 
@@ -31,7 +31,7 @@ The file is CUSTOMER data. It, the mapping config written for it, and every outp
    npm run intake -- validate --label CUSTOMER --name sporttrade-v1
    npm run intake -- readiness --label CUSTOMER --name sporttrade-v1
    ```
-   `map` writes `events.json` (tokenized) and `map-report.json`: every row dropped or fixed, by reason and count, never by content, plus the unmapped columns by name. `validate` runs the engine's `validateEvents` and the PII-header rule. `readiness` writes `readiness.json` and `readiness.md`: which signals and parameters are estimable, which are not and why, which fields would unlock each, field coverage, and how many traders have enough history for held-out validation. That file is the ask list for Sporttrade.
+   `map` writes `events.json` (tokenized) and `map-report.json`: every row dropped or fixed, by reason and count, never by content, plus the unmapped columns by name. `validate` runs the engine's `validateEvents` and the PII-header rule. `readiness` writes `readiness.json` and `readiness.md`: which derivation methods worked and what had to be assumed (provenance coverage), the outcome-timing share (ADR-018), which signals and parameters are estimable, which are not and why, field coverage, and how many traders have enough history for held-out validation. It is not a list of requests: it says what this export, as it is, can and can't support.
 6. **Run end to end.** A quick look first, then the full run:
    ```
    npm run intake -- run --config data/sporttrade/mapping.json --label CUSTOMER --name sporttrade-v1-quick --traders 200 --holdout-replicates 10 --sweep-replicates 8 --policies stake_limit,cooldown
@@ -52,9 +52,11 @@ $env:PLAYMIND_TOKEN_SALT = node -e "process.stdout.write(require('crypto').rando
 npm run intake -- run --config test/fixtures/intake/ledger-mapping.json --label SYNTHETIC
 ```
 
-## Fields we need
+## What each field enables
 
 Generated from `BEHAVIOR_SIGNAL_DEFINITIONS` and `TWIN_PARAMETER_DEFINITIONS` by `npm run intake -- fields`; `test/intake-readiness.test.mjs` fails if this table drifts from the definitions.
+
+These are fields of the analytical schema, not requests to the venue: intake maps or derives them from the export as it is (ADR-017), and readiness reports which ones it could fill and how.
 
 - **Required**: fields every signal and parameter needs, plus the schema fields intake fills itself.
 - **Strongly wanted**: fields a parameter needs that has no proxy.
@@ -213,15 +215,17 @@ Every event carries `provenance`: for each derivable field (`stake_amount`, `rea
 
 What map refuses: a mapped column that looks like direct PII (by header, or by email, phone, IP, or person-name shaped values), even as the trader ID; a column whose header names an account or person mapped to anything but `trader.column`; a target that is not a schema field; and a run without a salt. Unmapped columns, including flagged ones, are dropped and listed by name.
 
-## Open questions for Sporttrade
+## Clarifications about existing fields
 
-1. **Time zone.** What time zone are the timestamps in? Do they carry an offset? Which event time is it: placement, matching, or settlement?
-2. **Units.** Are amounts in cents or dollars, and the same unit in every column?
-3. **Realized P&L.** How is it recorded: per trade on settlement, per settlement event (separate rows), or mark-to-market? Is it net of fees and commission? How are partial fills, early cash-outs, and trades closed by an opposite trade shown? Is the sign from the trader's side?
-4. **Balances.** Is there an account balance before and after each trade, or a balance snapshot table? If balances exist only as snapshots, how often?
-5. **Restrictions and self-exclusions.** How do deposit limits, cool-offs, restrictions, and self-exclusions appear: as rows, a separate table, or not at all? With start and end times?
-6. **Account ID stability.** Is the account ID stable for the life of an account? Can one person have several accounts, and is there a link? Are any IDs reused after closure?
-7. **Voids and cancellations.** How do voided, cancelled, or unmatched orders appear? As separate rows, a status column, or removed?
-8. **Coverage.** What date range and roughly how many rows and accounts does the export cover? Is it every account, or a sample, and how was the sample drawn?
-9. **Deposits and withdrawals.** Are they in the same file as trades? Are failed or reversed deposits included?
-10. **Format.** CSV or JSON, delimiter, encoding, and is there one row per event or per order leg?
+Sporttrade sends its export as it is: nobody cleans it, adds rows, or adds fields for us. Everything the twin needs is derived from the columns they already have (ADR-017), and `readiness.md` reports which derivation methods worked and what had to be assumed. These questions only ask what existing columns mean, so the mapping config and the derive methods read them correctly. "Not recorded" is a fine answer to any of them.
+
+1. **Timestamps.** For each timestamp column: which time zone is it in, does it carry an offset, and which moment does it record (order placed, matched, or settled)? This decides `occurred_at`, and whether a column can give `placed_at` or `settled_at`.
+2. **Amounts.** For each amount column: cents or dollars, and from whose side (the trader's or the house's)?
+3. **Results.** Which existing column or rows hold a trade's settled result: a P&L column, settlement credit and debit columns, a payout, or contract price, quantity, side, and outcome? Is it net of fees? How do partial fills, early cash-outs, and trades closed by an opposite trade show up in those rows?
+4. **Orders and fills.** Which column identifies an order, and can one order appear on several rows (legs or fills)? Is there an order-creation time anywhere in the export?
+5. **Settlement postings.** If the export has a cash ledger: which entry types mark a settlement, and which column links a posting to its trade (an order or position ID)? If not: is there a settlement time on the trade row or on a market table?
+6. **Ledger and balances.** Which ledger entry types are deposits, withdrawals, stakes, payouts, and fees? Are there balance snapshot rows, and what do they mean (before or after the row)? Does the ledger cover each account from opening, or start partway through?
+7. **Restrictions and self-exclusions.** If they appear in the export, which rows or columns carry them, with what start and end times?
+8. **Account IDs.** Is the account column stable for the life of an account, and are IDs ever reused after closure? Can one person hold several accounts, and does any column link them?
+9. **Voids and cancellations.** Which status or type values mark voided, cancelled, or unmatched orders?
+10. **Coverage and format.** Which period and accounts does the export cover (all accounts, or a sample, and how drawn)? Delimiter, encoding, and is it one row per event, per order, or per fill?

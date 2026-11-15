@@ -13,7 +13,9 @@ Where we stand before Sporttrade's historical export arrives, what we do in the 
 - [x] **The estimator recovers known behavior**, including traders who scale back after losses. `npm run twin:recovery -- --traders 2000` and `test/twin-recovery.test.mjs`.
 - [ ] **The twin beats both comparators on synthetic data.** True with balance fields; not without them, the path we expect for Sporttrade. There, it beats baseline-0.1 on every metric but not the naive model on session shape. `npm run twin:holdout -- --traders 2000`. Open: if Sporttrade can't send balances, the first report will most likely say the twin earns no claim on session shape. That is reported as is.
 - [x] **The report shows harm against activity, with assumptions and uncertainty.** Built by every `run` above; `test/report-v2.test.mjs`.
-- [x] **The field ask list and open questions are ready.** `npm run intake -- fields`, kept in sync by `test/intake-readiness.test.mjs`; the note to Alex is below.
+- [x] **Everything the twin needs is derived from the export as it is.** Multi-table intake and the derive stage (ADR-017) build orders, stakes, results, decision times, outcome times, and balances from the fields a venue already keeps. Readiness reports which methods worked and what had to be assumed, and the outcome-timing share (ADR-018). The clarification questions are below.
+- [x] **The twin reads outcome timing.** behavior-0.3.0 reacts to outcomes when they settle, not at the next trade; without `settled_at` it equals behavior-0.2.0 exactly (`test/behavior-settlement.test.mjs`), and on SYNTHETIC delayed traders it recovers chase and stop behavior that the old assumption hides (`test/settlement-recovery.test.mjs`).
+- [x] **It ran on public data at the intake scale.** OBSERVATIONAL Polymarket fills for 2,000 retail-screened wallets went through `npm run intake` with and without settled_at. Results stay in gitignored output.
 - [x] **Nothing customer-derived or headline-shaped can be committed.** `data/`, `analysis/output/`, `demo/output/`, `.env`, and CSVs outside `test/fixtures/` are gitignored (checked with `git check-ignore`). The tracked tree has no AUC or accuracy headline (searched). The public-data model script no longer writes its metrics into a tracked report.
 - [x] **Nothing depends on local files.** A fresh clone of the branch outside the repo passes `npm ci`, `npm run check`, `npm test`, and `npx tsc --noEmit`, with Windows line endings.
 
@@ -25,7 +27,7 @@ Where we stand before Sporttrade's historical export arrives, what we do in the 
 4. **Quick look** (hour 4). `run` with `--name sporttrade-v1-quick` and the small settings from SPORTTRADE_INTAKE.md step 6 writes to `data/output/sporttrade-v1-quick/`. Check the runtime before the full run.
 5. **Full run** (overnight). `run --name sporttrade-v1` writes the fit, validation, sweep, and `report-v2.html` to `data/output/sporttrade-v1/`. Raise Node's heap first if the file is larger than the dry run's.
 6. **Read and review** (day 2). Read `report-v2.html` as a confidential, customer-derived document. Note whether the twin earned a claim and which findings it reports. Have a second person review before anything leaves the team.
-7. **Reply to Sporttrade** (day 2). Send the follow-up ask, built from `readiness.md` (which fields would unlock what), and any open question the file didn't answer. Results go out only under the customer agreement.
+7. **Reply to Sporttrade** (day 2). Send only the clarifications the file didn't answer, about what existing columns mean (SPORTTRADE_INTAKE.md, "Clarifications about existing fields"). `readiness.md` says which derivations worked and what had to be assumed; it is not a list of new fields to ask for. Results go out only under the customer agreement.
 
 ## What we can and can't claim after the first run
 
@@ -35,26 +37,18 @@ Where we stand before Sporttrade's historical export arrives, what we do in the 
 
 ## Note for Alex
 
-> Hi Alex, here's what would help us most in the historical export, and a few questions about it.
+> Hi Alex, we'll take the historical export exactly as you have it: no cleaning, extra rows, or new fields needed. We work out what we need from the columns that are already there. A few questions would help us read those columns correctly. "Not recorded" is a fine answer to any of them.
 >
-> **Must have.** For every event: an internal account number that stays the same for the life of the account (not a name or email; we replace it with a code before any analysis), the date and time, and what kind of event it was (a trade, a deposit, or a withdrawal).
+> 1. For each time column: which time zone, and does it record when an order was placed, matched, or settled?
+> 2. For each amount column: cents or dollars, and from the trader's side or yours?
+> 3. Which columns or rows hold a trade's settled profit or loss? Is it after fees? How do partial fills, cash-outs, and positions closed by an opposite trade appear?
+> 4. Which column identifies an order, and can one order span several rows? Is the order-creation time anywhere in the export?
+> 5. If there's a cash ledger: which entry types are deposits, withdrawals, stakes, payouts, fees, and settlements, and which column links a ledger entry to its trade? Are there balance snapshot rows, and does the ledger start at each account's opening?
+> 6. If limits, cool-offs, restrictions, or self-exclusions appear in the export, where?
+> 7. Is the account number stable for the life of an account, and is it ever reused? Can one person hold several accounts?
+> 8. Which status values mark voided, cancelled, or unmatched orders?
+> 9. Which period and accounts does the export cover, and what format is it (delimiter, encoding, one row per event, order, or fill)?
 >
-> **Strongly wanted.** For trades: the amount staked, and the profit or loss once it settles. For deposits: the amount.
->
-> **Nice to have.** The account balance just before and just after each trade (the most useful of these), withdrawal and payout amounts, and records of deposit limits, cool-offs, restrictions, and self-exclusions with their start and end times. Market details like prices, contracts, and sides aren't needed.
->
-> **Please leave out** names, emails, phone numbers, postal addresses, dates of birth, government IDs, IP addresses, and device identifiers.
->
-> **Questions**
-> 1. Which time zone are the times in, and is it the time an order was placed, matched, or settled?
-> 2. Are amounts in cents or dollars, and the same in every column?
-> 3. How is profit or loss recorded: per trade at settlement, as separate settlement rows, or marked to market? Is it after fees? How do partial fills, early cash-outs, and trades closed by an opposite trade show up?
-> 4. Are balances available on each trade, or only as periodic snapshots? How often?
-> 5. How do limits, cool-offs, restrictions, and self-exclusions appear, if at all?
-> 6. Does an account number ever change or get reused, and can one person hold several accounts?
-> 7. How do voided, cancelled, or unmatched orders appear?
-> 8. What period does the export cover, roughly how many accounts and rows, and is it every account or a sample (and if a sample, how was it drawn)?
-> 9. Are deposits and withdrawals in the same file as trades, and are failed or reversed deposits included?
-> 10. What format: CSV or JSON, which delimiter and encoding, and one row per event or per order leg?
+> One condition on our side: the file must not contain names, emails, phone numbers, postal addresses, dates of birth, government IDs, IP addresses, or device identifiers. If any of those are in the export as it stands, please tell us before sending so we can agree how to handle it.
 >
 > We only analyze the data. We never contact traders, place trades, or hold funds. Thanks!

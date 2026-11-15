@@ -635,6 +635,9 @@ function simulateTrader(trader, context) {
  * - a refuel deposit (low-balance trigger, at placement) lands 1 second after the trade.
  * Outcomes landing between sessions change the balance and the latest settled outcome.
  */
+// As simulate.mjs SETTLEMENT_RULES: a lag is capped at 10 years, so it stays a valid date.
+const MAX_SETTLEMENT_LAG_SECONDS = 3650 * DAY_SECONDS;
+
 function simulateTraderDelayed(trader, context) {
   const p = trader.parameters;
   const { behavior, maxTradesPerSession, settlementDelay } = context;
@@ -736,7 +739,7 @@ function simulateTraderDelayed(trader, context) {
         outcome = 'loss';
         result = -stake;
       }
-      const lag = Math.max(0, Math.round(settlementDelay.medianMinutes * MINUTE_SECONDS * Math.exp(rng.normal(0, settlementDelay.spread))));
+      const lag = Math.min(MAX_SETTLEMENT_LAG_SECONDS, Math.max(0, Math.round(settlementDelay.medianMinutes * MINUTE_SECONDS * Math.exp(rng.normal(0, settlementDelay.spread)))));
       balance -= stake;
       emit(seconds, 'trade', { stakeCents: stake, resultCents: result, balanceBeforeCents: before, balanceAfterCents: balance, settleSeconds: seconds + lag });
       let index = pending.length;

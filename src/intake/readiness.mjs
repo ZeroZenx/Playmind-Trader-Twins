@@ -13,8 +13,13 @@
  * - Balance fields count as available only for traders whose every trade has both of them,
  *   because the engine takes the balance path per trader only then (DATA-DICTIONARY.md).
  *
+ * Readiness is not a list of requests: a venue sends its export as is (ADR-017). It reports
+ * which derivation methods worked, what had to be assumed, the outcome-timing share
+ * (ADR-018), and what the fields present can and can't support. askList (kept under that name
+ * for compatibility) is that last part: the fields whose absence limits a signal or parameter.
+ *
  * fieldAskList() turns the same tables into the required / strongly wanted / nice to have
- * list in docs/SPORTTRADE_INTAKE.md; a test checks the doc against it.
+ * table in docs/SPORTTRADE_INTAKE.md (what each field enables); a test checks the doc against it.
  *
  * Pure: no I/O.
  */
@@ -482,7 +487,7 @@ function pct(share) {
   return share === null ? 'n/a' : `${(100 * share).toFixed(1)}%`;
 }
 
-/** The readiness report as Markdown, for the ask list to Sporttrade. It carries the label. */
+/** The readiness report as Markdown. It carries the label. */
 export function renderReadinessMarkdown(readiness) {
   const lines = [];
   lines.push(`# Intake readiness (${readiness.label})`);
@@ -546,11 +551,13 @@ export function renderReadinessMarkdown(readiness) {
     }
     lines.push('');
   }
-  lines.push('## Ask list for this dataset');
+  lines.push('## What this export can\'t support');
+  lines.push('');
+  lines.push('Not requests: the export is used as it is. Each field below is absent after derivation, and limits what is listed with it. Clarifying what an existing column means can still help, if a derivation method could use it.');
   lines.push('');
   if (!readiness.askList.length) lines.push('Every signal and parameter is estimable from the fields present.');
   for (const entry of readiness.askList) {
-    lines.push(`- \`${entry.field}\`: ${entry.unlocks.length ? `unlocks ${entry.unlocks.join(', ')}` : ''}${entry.unlocks.length && entry.upgrades.length ? '; ' : ''}${entry.upgrades.length ? `upgrades ${entry.upgrades.join(', ')}` : ''}.`);
+    lines.push(`- \`${entry.field}\`: ${entry.unlocks.length ? `without it, not estimable: ${entry.unlocks.join(', ')}` : ''}${entry.unlocks.length && entry.upgrades.length ? '; ' : ''}${entry.upgrades.length ? `without it, a weaker path: ${entry.upgrades.join(', ')}` : ''}.`);
   }
   lines.push('');
   lines.push('## History depth');

@@ -111,6 +111,11 @@ export const GENERATOR_RULES = deepFreeze({
   minRefuelDelaySeconds: 60
 });
 
+// Settlement mode (ADR-018). A lag drawn from a long-tailed fit (lags of weeks, a wide spread,
+// and a posterior draw) can pass the largest valid date. Lags are capped at maxLagDays: an
+// outcome that far out never lands inside any simulated horizon, so the cap changes no metric.
+export const SETTLEMENT_RULES = deepFreeze({ maxLagDays: 3650 });
+
 export const METRIC_SETTINGS = deepFreeze({
   // A chase episode: a stake at least this many drawn baseStakes on the trade after a loss.
   chaseStakeMultiple: 1.25,
@@ -913,7 +918,7 @@ function simulateRun(plan, p, streams, context, replicate, intervention = NO_INT
         if (settling) {
           // The stake is debited now; the outcome lands after a drawn lag.
           if (money) balance -= stake;
-          const lag = Math.max(0, Math.round(p.settlementLag.medianMinutes * 60 * Math.exp(p.settlementLag.spread * streams.settlement.normal())));
+          const lag = Math.min(SETTLEMENT_RULES.maxLagDays * DAY_SECONDS, Math.max(0, Math.round(p.settlementLag.medianMinutes * 60 * Math.exp(p.settlementLag.spread * streams.settlement.normal()))));
           settleAt = seconds + lag;
           schedule({ at: settleAt, seq: settlementSeq++, outcome, resultCents: result, creditCents: stake + result });
         } else {
