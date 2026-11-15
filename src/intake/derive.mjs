@@ -114,7 +114,8 @@ export const METHODS = {
   [STAKE]: {},
   placed_at: {},
   settled_at: {},
-  orders: {}
+  orders: {},
+  balances: {}
 };
 
 // --- Binary contracts --------------------------------------------------------------------------------
@@ -359,6 +360,11 @@ function normalizeParams(field, name, entry, where, config) {
     } else if (kind === 'strings') {
       if (!Array.isArray(value) || !value.length || value.some((item) => typeof item !== 'string' || !item.trim())) throw configError(`${where}.${key} must be a list of strings.`);
       params[key] = value.map((item) => item.trim());
+    } else if (kind === 'raw' || kind === 'table') {
+      params[key] = value;
+    } else if (kind === 'nonnegative') {
+      if (!isFiniteNumber(value) || value < 0) throw configError(`${where}.${key} must be zero or a positive number.`);
+      params[key] = value;
     } else if (kind === 'positive') {
       if (!isFiniteNumber(value) || value <= 0) throw configError(`${where}.${key} must be a positive number.`);
       params[key] = value;
@@ -417,6 +423,7 @@ export function normalizeDerive(raw, config) {
       seen.add(key);
       return normalizeParams(field, name, entry, where, config);
     });
+    if (field === 'balances' && derive[field].length > 1) throw configError('derive.balances takes one method: balances come from one ledger.');
     const order = METHOD_ORDER[field];
     if (order) {
       const ranks = derive[field].map((entry) => order.indexOf(entry.name));
@@ -425,6 +432,7 @@ export function normalizeDerive(raw, config) {
       }
     }
   }
+  derive.rowTables = [...new Set(derive.balances.map((method) => method.params.ledger))];
   return derive;
 }
 
@@ -610,6 +618,226 @@ function closingTrades(records, method, notes) {
   }
 }
 
+// --- Balances from a cash ledger (ADR-019) ---------------------------------------------------------
+
+export const BALANCE_DEFAULTS = Object.freeze({ toleranceAbsolute: 0.01, toleranceRelative: 0 });
+
+METHODS.balances['ledger-replay'] = {
+  version: '0.1',
+  description: 'Replays the full cash ledger per account (deposits - withdrawals - stakes + payouts - fees, as the flows map them), anchored to a balance snapshot, or to zero when the extract covers the account from opening. Accounts that drift from a snapshot beyond the tolerance get no derived balances.',
+  params: {
+    ledger: { kind: 'table', required: true },
+    flows: { kind: 'raw', required: true },
+    snapshot: { kind: 'raw' },
+    anchor: { kind: 'enum:snapshot|opening', default: 'snapshot' },
+    toleranceAbsolute: { kind: 'nonnegative', default: BALANCE_DEFAULTS.toleranceAbsolute },
+    toleranceRelative: { kind: 'nonnegative', default: BALANCE_DEFAULTS.toleranceRelative },
+    linkAttribute: { kind: 'key' },
+    ledgerLinkAttribute: { kind: 'raw' },
+    linkTypes: { kind: 'strings' }
+  },
+  check(params, where, config) {
+    const ledger = config.tables[params.ledger];
+    if (!ledger || ledger.role !== 'events') throw configError(`${where}.ledger must name an events table: the ledger's rows carry the account and the posting time.`);
+    const fold = ledger.mapping.eventType.fold;
+    const numberAttribute = (name, at) => {
+      if (typeof name !== 'string' || ledger.attributes[name]?.kind !== 'number') throw configError(`${at}: table "${ledger.name}" has no number attribute "${name}".`);
+      return name;
+    };
+    if (!Array.isArray(params.flows) || !params.flows.length) throw configError(`${where}.flows must be a list of { when, add, subtract }.`);
+    const seen = new Set();
+    params.flows = params.flows.map((flow, index) => {
+      const at = `${where}.flows[${index}]`;
+      if (!isPlainObject(flow) || Object.keys(flow).some((key) => !['when', 'add', 'subtract'].includes(key))) throw configError(`${at} must be { when, add, subtract }.`);
+      if (!Array.isArray(flow.when) || !flow.when.length || flow.when.some((value) => typeof value !== 'string')) throw configError(`${at}.when must list the ledger type values this flow covers.`);
+      const add = (flow.add ?? []).map((name) => numberAttribute(name, `${at}.add`));
+      const subtract = (flow.subtract ?? []).map((name) => numberAttribute(name, `${at}.subtract`));
+      if (!add.length && !subtract.length) throw configError(`${at} adds and subtracts nothing.`);
+      const when = flow.when.map((value) => fold(value));
+      for (const value of when) {
+        if (seen.has(value)) throw configError(`${at}: a type value is in two flows.`);
+        seen.add(value);
+      }
+      return { when: new Set(when), add, subtract };
+    });
+    if (params.snapshot !== null) {
+      const snapshot = params.snapshot;
+      if (!isPlainObject(snapshot) || !Array.isArray(snapshot.when) || !snapshot.when.length) throw configError(`${where}.snapshot must be { when, balance }.`);
+      const when = snapshot.when.map((value) => fold(String(value)));
+      if (when.some((value) => seen.has(value))) throw configError(`${where}.snapshot: a snapshot type value is also a flow.`);
+      params.snapshot = { when: new Set(when), balance: numberAttribute(snapshot.balance, `${where}.snapshot.balance`) };
+    }
+    if (params.anchor === 'snapshot' && params.snapshot === null) throw configError(`${where}: anchor "snapshot" needs snapshot rows; use anchor "opening" only when the extract covers every account from opening.`);
+    if ((params.linkAttribute === null) !== (params.ledgerLinkAttribute === null)) throw configError(`${where}: linkAttribute and ledgerLinkAttribute go together.`);
+    if (params.ledgerLinkAttribute !== null && ledger.attributes[params.ledgerLinkAttribute]?.kind !== 'key') throw configError(`${where}.ledgerLinkAttribute: table "${ledger.name}" has no key attribute "${params.ledgerLinkAttribute}".`);
+    params.linkTypes = params.linkTypes ? new Set(params.linkTypes.map((value) => fold(value))) : null;
+  },
+  // Runs in its own pass (reconstructBalances).
+  apply() {
+    return null;
+  }
+};
+
+function sessionsOf(records, gapMs) {
+  const sessions = [];
+  let current = null;
+  let last = -Infinity;
+  for (const record of records) {
+    const t = eventTime(record.event);
+    if (!current || t - last > gapMs) {
+      current = [];
+      sessions.push(current);
+    }
+    current.push(record);
+    last = t;
+  }
+  return sessions;
+}
+
+/**
+ * ledger-replay: per account, replay every ledger row in time order (then row order). Flow
+ * rows move the balance; snapshot rows are checked against it. The anchor is the first
+ * snapshot (the replay is shifted to match it) or, with anchor "opening", zero. An account is
+ * left without derived balances, counted by reason, when a flow row has no amount, when it has
+ * no anchor, or when the replay drifts from any snapshot by more than max(toleranceAbsolute,
+ * toleranceRelative x |snapshot|). Each event's balance_before and balance_after are the
+ * replayed balance just before and just after its own ledger rows: the same row for an event
+ * from the ledger table, or the rows linked by linkAttribute at the event's earliest linked
+ * posting time. Within one account's session, observed and derived balances never mix: a
+ * session where every event has observed balances keeps them; otherwise, if the account was
+ * replayed, every event in the session gets derived balances.
+ */
+function reconstructBalances(records, method, context, behaviorOptions) {
+  const { params } = method;
+  const report = { method: method.label, anchor: params.anchor, tolerance: { absolute: params.toleranceAbsolute, relative: params.toleranceRelative }, accounts: 0, replayed: 0, rejected: {}, snapshotsChecked: 0, eventsDerived: 0, eventsUnlinked: 0, observedReplaced: 0, sessionsKeptObserved: 0 };
+  const reject = (reason) => { report.rejected[reason] = (report.rejected[reason] ?? 0) + 1; };
+  const rows = context.tables[params.ledger].rows ?? [];
+  const byTrader = new Map();
+  for (const row of rows) {
+    if (!byTrader.has(row.traderToken)) byTrader.set(row.traderToken, []);
+    byTrader.get(row.traderToken).push(row);
+  }
+  // Replay: row -> { before, after } in currency, per account that passes.
+  const positions = new Map();
+  for (const [trader, list] of byTrader) {
+    report.accounts += 1;
+    list.sort((a, b) => a.ms - b.ms || a.rowNumber - b.rowNumber);
+    let raw = 0;
+    let broken = false;
+    const steps = [];
+    const snapshots = [];
+    for (const row of list) {
+      const flow = params.flows.find((item) => item.when.has(row.typeKey));
+      if (flow) {
+        // As credit-minus-debit: a blank side of a flow is 0 when another side has an amount;
+        // a flow row with every amount blank is missing, and the replay can't go past it.
+        const values = [...flow.add, ...flow.subtract].map((name) => row.attributes[name]);
+        if (!values.some(isFiniteNumber)) {
+          broken = true;
+          break;
+        }
+        const amount = (name) => (isFiniteNumber(row.attributes[name]) ? row.attributes[name] : 0);
+        const change = flow.add.reduce((total, name) => total + amount(name), 0) - flow.subtract.reduce((total, name) => total + Math.abs(amount(name)), 0);
+        steps.push({ row, before: raw, after: raw + change });
+        raw += change;
+      } else if (params.snapshot && params.snapshot.when.has(row.typeKey)) {
+        const value = row.attributes[params.snapshot.balance];
+        if (isFiniteNumber(value)) snapshots.push({ raw, value });
+        steps.push({ row, before: raw, after: raw });
+      } else {
+        steps.push({ row, before: raw, after: raw });
+      }
+    }
+    if (broken) { reject('a flow row has no amount, so the replay would be wrong after it'); continue; }
+    let offset = 0;
+    if (params.anchor === 'snapshot') {
+      if (!snapshots.length) { reject('no balance snapshot to anchor the replay'); continue; }
+      offset = snapshots[0].value - snapshots[0].raw;
+    }
+    const drift = snapshots.some((snapshot) => {
+      report.snapshotsChecked += 1;
+      return Math.abs(snapshot.raw + offset - snapshot.value) > Math.max(params.toleranceAbsolute, params.toleranceRelative * Math.abs(snapshot.value)) + 1e-9;
+    });
+    if (drift) { reject('replayed balance drifts from a snapshot beyond the tolerance'); continue; }
+    report.replayed += 1;
+    const byRow = new Map();
+    const byEvent = new Map();
+    for (const step of steps) {
+      const position = { before: round8(step.before + offset) + 0, after: round8(step.after + offset) + 0, row: step.row }; // + 0: never -0
+      byRow.set(step.row.rowNumber, position);
+      if (step.row.event) byEvent.set(step.row.event, position);
+    }
+    positions.set(trader, { byRow, byEvent });
+  }
+
+  // Links from events to their ledger rows.
+  const linkIndex = new Map();
+  if (params.linkAttribute) {
+    for (const row of rows) {
+      const key = row.attributes[params.ledgerLinkAttribute];
+      if (key === null || key === undefined) continue;
+      if (params.linkTypes && !params.linkTypes.has(row.typeKey)) continue;
+      const id = `${row.traderToken}\u0000${key}`;
+      if (!linkIndex.has(id)) linkIndex.set(id, []);
+      linkIndex.get(id).push(row);
+    }
+  }
+  const balanceFor = (record) => {
+    const position = positions.get(record.event.trader_token);
+    if (!position) return null;
+    let linked = [];
+    if (record.table === params.ledger && record.source) {
+      const own = position.byEvent.get(record.source);
+      if (own) linked = [own.row];
+    } else if (params.linkAttribute && record.table !== params.ledger) {
+      const key = record.attributes[params.linkAttribute];
+      const found = key === null || key === undefined ? [] : linkIndex.get(`${record.event.trader_token}\u0000${key}`) ?? [];
+      if (found.length) {
+        const earliest = Math.min(...found.map((row) => row.ms));
+        linked = found.filter((row) => row.ms === earliest);
+      }
+    }
+    if (!linked.length) return null;
+    const ordered = linked.map((row) => position.byRow.get(row.rowNumber)).filter(Boolean).sort((a, b) => a.row.ms - b.row.ms || a.row.rowNumber - b.row.rowNumber);
+    if (!ordered.length) return null;
+    return { before: ordered[0].before, after: ordered.at(-1).after };
+  };
+
+  const gapMs = (behaviorOptions?.sessionGapMinutes ?? 30) * 60000;
+  const relevant = new Map();
+  for (const record of records) {
+    if (!PROVENANCE_SCOPE.balance_before.includes(record.event.type) || record.event.type === 'balance_snapshot') continue;
+    if (!relevant.has(record.event.trader_token)) relevant.set(record.event.trader_token, []);
+    relevant.get(record.event.trader_token).push(record);
+  }
+  for (const [trader, list] of relevant) {
+    list.sort(compareEvents);
+    for (const session of sessionsOf(list, gapMs)) {
+      const observed = session.every((record) => isFiniteNumber(record.event.balance_before) && isFiniteNumber(record.event.balance_after));
+      if (observed) {
+        report.sessionsKeptObserved += 1;
+        continue;
+      }
+      if (!positions.has(trader)) continue;
+      const derived = session.map((record) => balanceFor(record));
+      if (derived.some((value) => value === null)) {
+        // One event without its ledger rows: the session can't be all derived, so none of it is.
+        report.eventsUnlinked += derived.filter((value) => value === null).length;
+        continue;
+      }
+      session.forEach((record, index) => {
+        if (isFiniteNumber(record.event.balance_before) || isFiniteNumber(record.event.balance_after)) report.observedReplaced += 1;
+        record.event.balance_before = derived[index].before;
+        record.event.balance_after = derived[index].after;
+        record.provenance.balance_before = method.label;
+        record.provenance.balance_after = method.label;
+        report.eventsDerived += 1;
+      });
+    }
+  }
+  return report;
+}
+
 /**
  * Derives fields on mapped events. input: { config (normalizeIntakeConfig output), tables:
  * { [name]: { role: 'events', events, attributes (WeakMap event -> attributes), rows } |
@@ -618,7 +846,8 @@ function closingTrades(records, method, notes) {
  *
  * Order: stake and result per row; decision and outcome times per row; order merging (stakes
  * and results sum, the earliest decision time and the latest outcome time); closing-trade
- * outcome times; then provenance. An outcome time is kept only on a trade with a result.
+ * outcome times; balances from the cash ledger (ADR-019); then provenance. An outcome time is
+ * kept only on a trade with a result.
  */
 export function deriveEvents({ config, tables }) {
   const counter = new Counter();
@@ -638,6 +867,7 @@ export function deriveEvents({ config, tables }) {
         provenance: {},
         times: {},
         rows: 1,
+        source: event,
         mapping
       });
     }
@@ -672,6 +902,7 @@ export function deriveEvents({ config, tables }) {
   records = mergeOrders(records, config.derive.orders, merges, notes);
   const closing = config.derive.settled_at.find((method) => method.name === 'closing-trade');
   if (closing) closingTrades(records, closing, notes);
+  const balances = config.derive.balances.length ? reconstructBalances(records, config.derive.balances[0], context, config.behaviorOptions) : null;
 
   const events = [];
   for (const record of records) {
@@ -717,6 +948,7 @@ export function deriveEvents({ config, tables }) {
         ? { rowsIn, eventsOut: records.length, ordersMerged: merges.counts.orders ?? {}, rowsMergedAway: merges.counts.rowsMerged ?? {} }
         : null,
       joins: context.joinStats,
+      balances,
       assumptions: ASSUMPTIONS,
       notes: notes.counts,
       note: 'Events per derivable field by source: observed (a mapped column), derived:<method> (the first configured method that gave a value), assumed (the engine default), or unavailable. Counts only, never values.'

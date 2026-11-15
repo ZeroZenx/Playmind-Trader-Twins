@@ -160,6 +160,7 @@ Derive methods (intake-derive-0.1.0). Parameters that name attributes refer to a
 | `realized_result` | `contract-resolution` 0.1 | `price`, `quantity` (numbers), `side` (key), `buy`, `sell` (side values; default `buy`, `sell`), `won` (boolean), `priceScale` (default 1; 100 for prices in cents), `contractValue` (what a winning contract pays, default 1) | the hold-to-resolution P&L of a binary contract: a buy wins (1 - p) q or loses p q; a sell the reverse. `won` blank (unresolved) is unavailable |
 | `stake_amount` | `contract-resolution` 0.1 | as above, without `won` | the amount at risk: p q for a buy, (1 - p) q for a sell |
 | `orders` | `order-id` 0.1 | `key` (a key attribute, or a list that together identify the order) | merges one trader's rows that share an order ID |
+| `balances` | `ledger-replay` 0.1 | see "Balances from a cash ledger" below | `balance_before` and `balance_after` from the replayed cash ledger |
 | `orders` | `account-market-side-time` 0.1 | `market`, `side` (keys) | fallback: merges one trader's rows with the same market, side, and timestamp |
 | `placed_at` | `order-created` 0.1 | `attribute` (a timestamp on the trade row), or `join` and `joinAttribute` (a timestamp on an orders table) | the order-creation time; a time after the execution time is skipped |
 | `settled_at` | `ledger-settlement` 0.1 | `join` (into a ledger events table, by order or position ID), `kind` and `kinds` (which postings mean settlement) | the latest matching posting's time |
@@ -173,6 +174,40 @@ How the methods combine:
 - **Outcome time in a fixed order of preference**: `ledger-settlement`, `trade-settlement-column`, `market-settlement`, `closing-trade`. List the ones the export supports, in that order; a list out of order is refused. A time before the trade is skipped and counted, and the next method is tried. An outcome time is kept only on a trade with a result. `closing-trade` runs after orders are merged, and only gives a time to the trade it closes, not to the closing trade. Pair it with a result method that realizes at close; with `contract-resolution` (hold to resolution) the outcome would be early.
 - **Market tables are optional.** With only a trades table the core path works: the decision time and the outcome time are then assumed.
 - Join hits are counted per join under `derive.joins` (`looked` is rows with a key, `found` is rows the join matched). Skips and merge problems are counted under `derive.notes`.
+
+### Balances from a cash ledger
+
+When trades carry no balances but the export has a cash ledger, `derive.balances` rebuilds them (ADR-019):
+
+```json
+"derive": {
+  "balances": [{
+    "method": "ledger-replay",
+    "ledger": "ledger",
+    "flows": [
+      { "when": ["DEPOSIT", "PAYOUT"], "add": ["amount"] },
+      { "when": ["WITHDRAWAL", "STAKE", "FEE"], "subtract": ["amount"] }
+    ],
+    "snapshot": { "when": ["BALANCE"], "balance": "amount" },
+    "anchor": "snapshot",
+    "toleranceAbsolute": 0.01,
+    "linkAttribute": "order_key",
+    "ledgerLinkAttribute": "order_key",
+    "linkTypes": ["STAKE"]
+  }]
+}
+```
+
+| Parameter | Meaning |
+| --- | --- |
+| `ledger` | The events table holding the ledger. Every row with an account and a time is replayed, including rows whose type the mapping ignores. |
+| `flows` | `{ when, add, subtract }`: the ledger type values a flow covers, and the number attributes it adds or subtracts (subtracted amounts count as absolute values). Within a flow a blank amount is 0 when another is set; a flow row with every amount blank refuses the account. |
+| `snapshot` | `{ when, balance }`: type values that carry a balance snapshot, and the attribute holding it. |
+| `anchor` | `snapshot` (default): the first snapshot anchors the replay. `opening`: start at zero; only when the extract covers every account from opening. |
+| `toleranceAbsolute`, `toleranceRelative` | Largest allowed drift from any snapshot: max(absolute, relative x |snapshot|). Defaults 0.01 and 0. An account that drifts more gets no derived balances. |
+| `linkAttribute`, `ledgerLinkAttribute`, `linkTypes` | How an event from another table finds its ledger rows: matching keys, at the earliest linked posting (optionally only these types). Events from the ledger table use their own row. |
+
+Within one account's session, observed and derived balances never mix. `map-report.json` reports accounts replayed, refused by reason, snapshots checked, events derived, events with no linked row, and observed balances replaced, under `derive.balances`.
 
 Every event carries `provenance`: for each derivable field (`stake_amount`, `realized_result`, `placed_at`, `settled_at`, `balance_before`, `balance_after`) that applies to its type, `observed`, `derived:<method>-<version>`, or `assumed`. `placed_at` is assumed when no method gives a decision time (the execution time is used), and `settled_at` when no method gives an outcome time for a trade with a result (the outcome is taken as known before the next trade). A field with no entry is unavailable. `map-report.json` counts events per field per source under `derive.byField`, `npm run intake -- map` prints the counts, and `readiness.md` shows them in "Where derived fields came from".
 
