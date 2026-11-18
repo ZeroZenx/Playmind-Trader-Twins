@@ -2,6 +2,10 @@ import { spawnSync } from "node:child_process";
 
 const steps = [
   ["syntax", "npm", ["run", "check"]],
+  ["integration syntax", "node", ["--check", "scripts/migrate.mjs"]],
+  ["worker syntax", "node", ["--check", "scripts/process-jobs.mjs"]],
+  ["pipeline syntax", "node", ["--check", "src/engine/pipeline.mjs"]],
+  ["runner syntax", "node", ["--check", "src/lib/twin-runner.mjs"]],
   ["tests", "npm", ["test"]],
   ["types", "npx", ["tsc", "--noEmit"]],
   ["production build", "npm", ["run", "build"]],

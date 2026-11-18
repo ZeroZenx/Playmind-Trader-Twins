@@ -1,5 +1,25 @@
 # Operations runbook
 
+## Migration and worker operations
+
+Run migrations with a direct, non-pooled `DATABASE_URL`:
+
+```bash
+npm run db:migrate
+```
+
+The runner records the baseline checksum and every numbered SQL migration in `schema_migrations`. It adopts an existing baseline schema before applying new migrations. A changed checksum stops the run.
+
+Process one queued experiment locally or from a scheduled worker:
+
+```bash
+npm run worker:once
+```
+
+The worker claims one queued job, runs the shared analysis pipeline, stores model parameters and report results, and marks the experiment `succeeded` or `failed`. Re-running a failed job requires a new queue request after the underlying issue is fixed.
+
+The web route `POST /api/jobs/process` supports an authenticated smoke test. Production deployment should invoke the same worker module from a durable queue or scheduled job.
+
 ## Release verification
 
 Run the repository release gate before a deployment:

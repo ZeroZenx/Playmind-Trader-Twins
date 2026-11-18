@@ -24,8 +24,8 @@ Next.js web application and API route handlers
   +--> Object storage (next gate for large uploads)
   |      Encrypted raw uploads and generated report artifacts
   |
-  +--> Job worker (next gate for asynchronous customer processing)
-         Validation, signal calculation, twin builds, simulations, reports
+  +--> Durable analysis job worker
+         Validation, twin fitting, held-out validation, simulations, reports
                   |
                   v
            Analytics engine
@@ -48,6 +48,9 @@ Current modules:
 - `src/lib/ingestion.ts` rejects direct identity headers and validates tokenized CSV events.
 - `src/lib/venue.ts` exposes a read-only Polymarket public-market adapter.
 - `src/lib/auth/` and `src/proxy.ts` enforce the authentication boundary.
+- `src/engine/pipeline.mjs` runs the shared validate -> fit -> holdout -> policy -> report path.
+- `src/lib/twin-runner.mjs` claims queued jobs and persists the pipeline outputs.
+- `scripts/migrate.mjs` tracks the baseline and numbered migrations in `schema_migrations`.
 
 ## Domain flow
 
@@ -55,8 +58,9 @@ Current modules:
 Dataset upload
   -> schema validation
   -> data-quality report
-  -> signal run
-  -> twin build
+  -> queued analysis job
+  -> twin fit
+  -> held-out validation
   -> policy experiment
   -> evidence report
   -> reviewer approval

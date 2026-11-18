@@ -38,12 +38,21 @@ export async function POST(request: Request, { params }: { params: Promise<{ id:
       parser: "tokenized-csv-v1",
       validRows: parsed.events.length,
       rejectedRows: parsed.errors.length,
-      duplicateEventIds: parsed.events.length - eventIds.size,
+      duplicateEventIds: parsed.errors.filter((error) => error.message.startsWith("Duplicate event_id:")).length,
       directPiiHeadersRejected: false,
       headers: parsed.headers,
     };
 
     const result = await withTransaction(async (client) => {
+      const priorExperiments = await client.query<{ count: number }>(
+        `SELECT count(*)::int AS count FROM experiments WHERE dataset_id = $1`,
+        [id],
+      );
+      if (priorExperiments.rows[0].count > 0) {
+        throw new Error("Dataset already has an experiment. Create a new dataset for a replacement upload.");
+      }
+      await client.query(`DELETE FROM signal_runs WHERE dataset_id = $1`, [id]);
+      await client.query(`DELETE FROM trader_events WHERE dataset_id = $1`, [id]);
       const job = await client.query<{ id: string }>(
         `INSERT INTO ingestion_jobs
           (workspace_id, dataset_id, source_kind, source_filename, status, created_by, started_at)
@@ -63,14 +72,15 @@ export async function POST(request: Request, { params }: { params: Promise<{ id:
           `INSERT INTO trader_events
             (workspace_id, dataset_id, event_id, trader_token, occurred_at, type, venue_id, market_id, market_type,
              side, price, quantity, stake_amount, payout_amount, deposit_amount, withdrawal_amount, balance_before,
-             balance_after, policy_event_type, policy_event_value, realized_result, source_row_number)
-           VALUES ($1, $2, $3, $4, $5, $6::event_type, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22)
+             balance_after, policy_event_type, policy_event_value, realized_result, placed_at, settled_at, provenance, source_row_number)
+           VALUES ($1, $2, $3, $4, $5, $6::event_type, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25::jsonb, $26)
            ON CONFLICT (dataset_id, event_id) DO NOTHING`,
           [context.workspace.id, id, values.event_id, values.trader_token, values.occurred_at, values.type, values.venue_id,
             values.market_id ?? null, values.market_type ?? null, values.side ?? null, values.price ?? null, values.quantity ?? null,
             values.stake_amount ?? null, values.payout_amount ?? null, values.deposit_amount ?? null, values.withdrawal_amount ?? null,
             values.balance_before ?? null, values.balance_after ?? null, values.policy_event_type ?? null, values.policy_event_value ?? null,
-            values.realized_result ?? null, values.source_row_number],
+            values.realized_result ?? null, values.placed_at ?? null, values.settled_at ?? null,
+            JSON.stringify(values.provenance ?? {}), values.source_row_number],
         );
       }
       const finalStatus = parsed.errors.length ? "rejected" : "ready";

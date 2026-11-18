@@ -34,6 +34,17 @@ The intake pipeline runs end to end, on one command, from a raw ledger-shaped ex
 | Public-data holdout model (OBSERVATIONAL) | Built and evaluated; results in local output only (ADR-008) | Independent validation and model governance review |
 | Deployment | Pending: `vercel.json` and the release gate (`npm run verify:release`) are in place | Vercel team approval, environment variables, live health check |
 
+### Vertical analysis path
+
+| Stage | Status | Evidence |
+| --- | --- | --- |
+| Queue an experiment run | Built locally | `POST /api/experiments/:id/run` writes `analysis_jobs` |
+| Claim and process a job | Built locally | `src/lib/twin-runner.mjs`, `npm run worker:once` |
+| Validate, fit, hold out, simulate, report | Built locally | `src/engine/pipeline.mjs` |
+| Persist priors and trader parameters | Built locally | migration `0002_analysis_pipeline.sql` and worker persistence |
+| Display a saved report | Built locally | `/reports/:id`, `GET /api/reports/:id` |
+| Staging migration and hosted worker | Pending | Requires a configured staging `DATABASE_URL` and hosting job |
+
 ## Validated on synthetic data only
 
 Everything below was checked on SYNTHETIC populations from the behavioral generator, whose true parameters are known. None of it says anything yet about a real trader.

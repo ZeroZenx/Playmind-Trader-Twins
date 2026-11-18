@@ -29,6 +29,9 @@ export const eventSchema = z.object({
   policy_event_type: z.string().nullable().optional(),
   policy_event_value: z.string().nullable().optional(),
   realized_result: z.coerce.number().finite().nullable().optional(),
+  placed_at: z.string().datetime({ offset: true }).nullable().optional(),
+  settled_at: z.string().datetime({ offset: true }).nullable().optional(),
+  provenance: z.record(z.string(), z.string()).nullable().optional(),
   source_row_number: z.coerce.number().int().positive(),
 });
 

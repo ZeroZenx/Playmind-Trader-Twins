@@ -93,3 +93,4 @@ export {
 export { buildReport, renderHtmlReport } from './report.mjs';
 // report-0.2.0: the evidence report v2 (data, population, validation, policy, affected, assumptions).
 export { REPORT_SECTIONS, REPORT_V2_DEFAULTS, REPORT_V2_VERSION, buildReportV2, renderReportV2Html } from './report-v2.mjs';
+export { PIPELINE_VERSION, runTwinPipeline } from './pipeline.mjs';

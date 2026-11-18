@@ -13,6 +13,7 @@ const createSchema = z.object({
   sourceFilename: z.string().min(1).max(200),
   schemaVersion: z.string().min(1).max(40).default("tokenized-trader-event-v1"),
   isSynthetic: z.boolean().default(false),
+  dataLabel: z.enum(["SYNTHETIC", "OBSERVATIONAL", "CUSTOMER"]).default("CUSTOMER"),
 });
 
 export async function GET() {
@@ -40,10 +41,10 @@ export async function POST(request: Request) {
     const sourceSha256 = createHash("sha256").update(`${body.name}:${body.sourceFilename}:${Date.now()}`).digest("hex");
     const result = await query(
       `INSERT INTO datasets
-        (workspace_id, name, source_filename, source_sha256, schema_version, is_synthetic, created_by)
-       VALUES ($1, $2, $3, $4, $5, $6, $7)
-       RETURNING id, name, status::text, is_synthetic, created_at`,
-      [context.workspace.id, body.name, body.sourceFilename, sourceSha256, body.schemaVersion, body.isSynthetic, context.user.id],
+        (workspace_id, name, source_filename, source_sha256, schema_version, is_synthetic, data_label, created_by)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+       RETURNING id, name, status::text, is_synthetic, data_label, created_at`,
+      [context.workspace.id, body.name, body.sourceFilename, sourceSha256, body.schemaVersion, body.isSynthetic || body.dataLabel === "SYNTHETIC", body.dataLabel, context.user.id],
     );
     await recordAudit({ workspaceId: context.workspace.id, actorUserId: context.user.id, action: "dataset.created", targetType: "dataset", targetId: result.rows[0].id, details: { sourceFilename: body.sourceFilename, isSynthetic: body.isSynthetic } });
     return NextResponse.json({ dataset: result.rows[0] }, { status: 201 });
