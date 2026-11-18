@@ -1,9 +1,11 @@
 import { NextResponse } from "next/server";
+import { createHash } from "node:crypto";
 import { z } from "zod";
 import { query, withTransaction } from "@/src/lib/db";
 import { routeError } from "@/src/lib/route";
 import { requireWorkspaceContext } from "@/src/lib/workspace";
 import { recordAudit } from "@/src/lib/audit";
+import { consumeRateLimit, requestAddress } from "@/src/lib/rate-limit";
 
 export const dynamic = "force-dynamic";
 
@@ -21,8 +23,12 @@ export async function POST(request: Request, { params }: { params: Promise<{ id:
   try {
     const context = await requireWorkspaceContext();
     if (!["owner", "analyst"].includes(context.workspace.role)) throw new Error("FORBIDDEN");
+    const rate = await consumeRateLimit(`experiment-run:${context.workspace.id}:${requestAddress(request)}`, 30, 3600);
+    if (!rate.allowed) return NextResponse.json({ error: "Experiment rate limit exceeded", resetAt: rate.resetAt }, { status: 429 });
     const { id } = await params;
     const body = runSchema.parse(await request.json().catch(() => ({})));
+    const idempotencyKey = request.headers.get("idempotency-key")?.trim()
+      || createHash("sha256").update(JSON.stringify(body)).digest("hex");
     const experiment = await query<{ id: string; dataset_id: string; status: string }>(
       `SELECT id, dataset_id, status::text FROM experiments WHERE id = $1 AND workspace_id = $2`,
       [id, context.workspace.id],
@@ -39,10 +45,11 @@ export async function POST(request: Request, { params }: { params: Promise<{ id:
     const result = await withTransaction(async (client) => {
       const job = await client.query<{ id: string; status: string; created_at: string }>(
         `INSERT INTO analysis_jobs
-          (workspace_id, experiment_id, dataset_id, job_type, status, payload, created_by)
-         VALUES ($1, $2, $3, 'experiment_run', 'queued', $4::jsonb, $5)
+          (workspace_id, experiment_id, dataset_id, job_type, status, payload, idempotency_key, created_by)
+         VALUES ($1, $2, $3, 'experiment_run', 'queued', $4::jsonb, $5, $6)
+         ON CONFLICT (experiment_id, idempotency_key) DO UPDATE SET updated_at = now()
          RETURNING id, status::text, created_at`,
-        [context.workspace.id, id, experiment.rows[0].dataset_id, JSON.stringify(body), context.user.id],
+        [context.workspace.id, id, experiment.rows[0].dataset_id, JSON.stringify(body), idempotencyKey, context.user.id],
       );
       await client.query(
         `UPDATE experiments SET status = 'queued', last_job_id = $2, updated_at = now()

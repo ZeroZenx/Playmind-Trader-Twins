@@ -86,9 +86,10 @@ export async function POST(request: Request, { params }: { params: Promise<{ id:
       const finalStatus = parsed.errors.length ? "rejected" : "ready";
       await client.query(
         `UPDATE datasets
-            SET status = $1::dataset_status, row_count = $2, trader_count = $3, starts_at = $4, ends_at = $5, updated_at = now()
-          WHERE id = $6`,
-        [finalStatus, parsed.events.length, traders.size, startsAt, endsAt, id],
+            SET status = $1::dataset_status, upload_status = $6, row_count = $2, trader_count = $3, starts_at = $4, ends_at = $5,
+            content_type = 'text/csv', size_bytes = $7, malware_scan_status = 'skipped', uploaded_at = now(), updated_at = now()
+          WHERE id = $8`,
+        [finalStatus, parsed.events.length, traders.size, startsAt, endsAt, finalStatus === "ready" ? "processed" : "failed", file.size, id],
       );
       await client.query(
         `UPDATE ingestion_jobs

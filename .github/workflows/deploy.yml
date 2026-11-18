@@ -1,0 +1,41 @@
+name: PlayMind production deployment
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+env:
+  VERCEL_ORG_ID: ${{ vars.VERCEL_ORG_ID }}
+  VERCEL_PROJECT_ID: ${{ vars.VERCEL_PROJECT_ID }}
+  VERCEL_CLI_VERSION: ${{ vars.VERCEL_CLI_VERSION }}
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run verify:release
+      - name: Install Vercel CLI
+        run: npm install -g "vercel@${VERCEL_CLI_VERSION:?Set VERCEL_CLI_VERSION in the production environment}"
+      - name: Pull production environment
+        run: vercel pull --yes --environment=production
+        env:
+          VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+      - name: Build deployment artifact
+        run: vercel build --prod
+      - name: Deploy production artifact
+        run: vercel deploy --prebuilt --prod --skip-domain
+        env:
+          VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}

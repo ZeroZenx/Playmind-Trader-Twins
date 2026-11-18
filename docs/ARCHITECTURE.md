@@ -21,11 +21,12 @@ Next.js web application and API route handlers
   |      Workspace, users, datasets, events, signals, twins,
   |      policies, experiments, reports, audit events
   |
-  +--> Object storage (next gate for large uploads)
-  |      Encrypted raw uploads and generated report artifacts
+  +--> Private object storage
+  |      Authenticated raw uploads and generated report artifacts
   |
   +--> Durable analysis job worker
-         Validation, twin fitting, held-out validation, simulations, reports
+         File validation, event ingestion, twin fitting, held-out validation,
+         simulations, reports, retries
                   |
                   v
            Analytics engine
@@ -77,7 +78,7 @@ Owns users, roles, workspace membership, and tenant authorization.
 
 Owns upload metadata, file checksums, schema versions, validation status, raw-file references, and data-quality reports.
 
-The first path stores validated event rows in Neon. Object storage and signed large-file uploads remain required before a customer-scale launch.
+The upload path sends files directly to private object storage through an authenticated client-upload token. A database-backed ingestion job validates the object, hashes the content, rejects direct PII, and writes normalized rows to Neon. The existing small-file route stays available for local development.
 
 ### Event and signal service
 
@@ -122,7 +123,7 @@ Owns append-only records for sensitive actions.
 1. Local Node.js demo.
 2. Local Next.js application with Neon Auth and Neon PostgreSQL.
 3. Vercel project with production environment variables.
-4. Hosted health, sign-in, protected-route, upload, and read-only venue checks.
-5. Object storage, signed uploads, asynchronous jobs, and production retention controls.
-6. Security review and approved design-partner data contract.
+4. Hosted health, sign-in, protected-route, signed upload, and read-only venue checks.
+5. Vercel Cron invokes the secret-protected worker once per minute. Leased database jobs provide retry and recovery.
+6. Retention controls, security review, and approved design-partner data contract.
 7. Production pilot deployment.

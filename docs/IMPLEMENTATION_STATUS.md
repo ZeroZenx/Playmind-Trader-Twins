@@ -28,11 +28,11 @@ The intake pipeline runs end to end, on one command, from a raw ledger-shaped ex
 | Web application (Next.js App Router, `src/app/`) | Built locally; production build passes | Vercel deployment and browser QA on the hosted URL |
 | Hosted database (Neon, PostgreSQL schema applied) | Built | Backup, retention, and production monitoring |
 | Authentication (Neon Managed Auth) | Built | Production trusted domain and cookie secret |
-| Tokenized CSV upload | Built: SHA-256 provenance, required columns, duplicate and PII header rejection, row validation, ingestion jobs | Object storage, signed uploads, malware scanning, large-file queue, retention controls |
+| Tokenized CSV upload | Built: private object storage token flow, SHA-256 provenance, required columns, duplicate and PII header rejection, row validation, leased ingestion jobs, rate limits, retention fields | Malware scanning and customer-specific retention policy approval |
 | API route handlers | Built locally | Hosted deployment, rate limits, observability |
 | Read-only Polymarket public adapter | Built; execution disabled (ADR-007) | None planned: no order placement or custody |
 | Public-data holdout model (OBSERVATIONAL) | Built and evaluated; results in local output only (ADR-008) | Independent validation and model governance review |
-| Deployment | Pending: `vercel.json` and the release gate (`npm run verify:release`) are in place | Vercel team approval, environment variables, live health check |
+| Deployment | Release configuration built: `vercel.json`, private Blob flow, secret-protected Cron worker, and release gate | Vercel team approval, environment variables, live health check |
 
 ### Vertical analysis path
 
@@ -43,7 +43,7 @@ The intake pipeline runs end to end, on one command, from a raw ledger-shaped ex
 | Validate, fit, hold out, simulate, report | Built locally | `src/engine/pipeline.mjs` |
 | Persist priors and trader parameters | Built locally | migration `0002_analysis_pipeline.sql` and worker persistence |
 | Display a saved report | Built locally | `/reports/:id`, `GET /api/reports/:id` |
-| Staging migration and hosted worker | Pending | Requires a configured staging `DATABASE_URL` and hosting job |
+| Staging migration and hosted worker | Built in code | Requires Vercel team approval, private Blob store, production variables, and hosted smoke test |
 
 ## Validated on synthetic data only
 

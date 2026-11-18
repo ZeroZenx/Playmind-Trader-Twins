@@ -1,5 +1,6 @@
 import pg from 'pg';
 import { processNextAnalysisJob } from '../src/lib/twin-runner.mjs';
+import { processNextIngestionJob } from '../src/lib/ingestion-runner.mjs';
 
 const { Pool } = pg;
 const databaseUrl = process.env.DATABASE_URL;
@@ -14,7 +15,8 @@ const pool = new Pool({
 });
 
 try {
-  const result = await processNextAnalysisJob(pool);
+  const ingestion = await processNextIngestionJob(pool);
+  const result = ingestion.status === 'idle' ? await processNextAnalysisJob(pool) : ingestion;
   console.log(JSON.stringify(result, null, 2));
   process.exitCode = result.status === 'failed' ? 1 : 0;
 } finally {

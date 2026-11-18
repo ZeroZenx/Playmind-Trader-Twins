@@ -4,6 +4,8 @@ const steps = [
   ["syntax", "npm", ["run", "check"]],
   ["integration syntax", "node", ["--check", "scripts/migrate.mjs"]],
   ["worker syntax", "node", ["--check", "scripts/process-jobs.mjs"]],
+  ["ingestion worker syntax", "node", ["--check", "src/lib/ingestion-runner.mjs"]],
+  ["blob helper syntax", "node", ["--check", "src/lib/blob.mjs"]],
   ["pipeline syntax", "node", ["--check", "src/engine/pipeline.mjs"]],
   ["runner syntax", "node", ["--check", "src/lib/twin-runner.mjs"]],
   ["tests", "npm", ["test"]],

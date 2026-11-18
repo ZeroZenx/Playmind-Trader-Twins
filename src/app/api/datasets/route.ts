@@ -5,6 +5,7 @@ import { query } from "@/src/lib/db";
 import { routeError } from "@/src/lib/route";
 import { requireWorkspaceContext } from "@/src/lib/workspace";
 import { recordAudit } from "@/src/lib/audit";
+import { consumeRateLimit, requestAddress } from "@/src/lib/rate-limit";
 
 export const dynamic = "force-dynamic";
 
@@ -37,8 +38,10 @@ export async function POST(request: Request) {
   try {
     const context = await requireWorkspaceContext();
     if (!["owner", "analyst"].includes(context.workspace.role)) throw new Error("FORBIDDEN");
+    const rate = await consumeRateLimit(`dataset-create:${context.workspace.id}:${requestAddress(request)}`, 30, 3600);
+    if (!rate.allowed) return NextResponse.json({ error: "Dataset creation rate limit exceeded", resetAt: rate.resetAt }, { status: 429 });
     const body = createSchema.parse(await request.json());
-    const sourceSha256 = createHash("sha256").update(`${body.name}:${body.sourceFilename}:${Date.now()}`).digest("hex");
+    const sourceSha256 = `pending:${createHash("sha256").update(`${body.name}:${body.sourceFilename}:${Date.now()}`).digest("hex")}`;
     const result = await query(
       `INSERT INTO datasets
         (workspace_id, name, source_filename, source_sha256, schema_version, is_synthetic, data_label, created_by)

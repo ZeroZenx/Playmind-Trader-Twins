@@ -15,7 +15,7 @@ Current delivery status:
 - Tokenized CSV customer-data intake built
 - Jan-Mar 2026 holdout model tested
 - Read-only Polymarket public-market adapter built
-- Vercel production deployment pending team-access approval and final environment setup
+- Vercel production deployment configuration built; deployment waits on team access approval and final environment setup
 
 See `docs/IMPLEMENTATION_STATUS.md` for the evidence, remaining gates, and deployment checklist.
 
@@ -80,7 +80,7 @@ Set `DATABASE_URL`, `NEON_AUTH_BASE_URL`, and `NEON_AUTH_COOKIE_SECRET` in the l
 npm run dev
 ```
 
-The app uses Neon Managed Auth and Postgres. Production data intake accepts tokenized CSV files. Direct identity fields receive an automatic rejection. Large-file object storage, background job queues, and customer-specific retention controls remain deployment gates.
+The app uses Neon Managed Auth and Postgres. Production data intake accepts tokenized CSV files through private object storage and a durable ingestion worker. Direct identity fields receive an automatic rejection. Malware scanning and customer-specific retention approval remain deployment gates.
 
 The holdout analysis uses the main [Polymarket users dataset](https://huggingface.co/datasets/vgregoire/polymarket-users), the dataset [documentation](https://www.vincentgregoire.com/polymarket-users-data), and the official [Polymarket Gamma API documentation](https://gamma-api.polymarket.com/docs). The separate raw-trades dataset was not used.
 

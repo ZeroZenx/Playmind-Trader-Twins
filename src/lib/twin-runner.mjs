@@ -249,7 +249,8 @@ async function persistPipeline(pool, job, dataset, result) {
       [job.experiment_id, dataset.workspace_id],
     );
     await client.query(
-      `UPDATE analysis_jobs SET status = 'succeeded', error_message = NULL, finished_at = now(), updated_at = now()
+      `UPDATE analysis_jobs SET status = 'succeeded', error_message = NULL, finished_at = now(), lease_expires_at = NULL,
+          worker_id = NULL, last_heartbeat_at = now(), updated_at = now()
        WHERE id = $1`,
       [job.id],
     );
@@ -259,15 +260,19 @@ async function persistPipeline(pool, job, dataset, result) {
 
 async function markFailed(pool, job, error) {
   const message = error instanceof Error ? error.message : String(error);
+  const retryable = Number(job.attempts) + 1 < Number(job.max_attempts ?? 3);
   await pool.query(
-    `UPDATE analysis_jobs SET status = 'failed', error_message = $2, finished_at = now(), updated_at = now() WHERE id = $1`,
-    [job.id, message.slice(0, 2000)],
+    `UPDATE analysis_jobs
+        SET status = $2::job_status, error_message = $3, finished_at = CASE WHEN $2 = 'failed' THEN now() ELSE NULL END,
+            lease_expires_at = NULL, worker_id = NULL, updated_at = now()
+      WHERE id = $1`,
+    [job.id, retryable ? 'queued' : 'failed', message.slice(0, 2000)],
   );
   await pool.query(
-    `UPDATE experiments SET status = 'failed', updated_at = now() WHERE id = $1`,
-    [job.experiment_id],
+    `UPDATE experiments SET status = $2::experiment_status, updated_at = now() WHERE id = $1`,
+    [job.experiment_id, retryable ? 'queued' : 'failed'],
   );
-  return { jobId: job.id, experimentId: job.experiment_id, status: 'failed', error: message };
+  return { jobId: job.id, experimentId: job.experiment_id, status: retryable ? 'queued' : 'failed', error: message, retryable };
 }
 
 async function claimJob(pool, { workspaceId = null, jobId = null } = {}) {
@@ -275,11 +280,11 @@ async function claimJob(pool, { workspaceId = null, jobId = null } = {}) {
   try {
     await client.query('BEGIN');
     const values = [];
-    const where = ["j.status = 'queued'"];
+    const where = ["(j.status = 'queued' OR (j.status = 'running' AND j.lease_expires_at < now()))"];
     if (workspaceId) { values.push(workspaceId); where.push(`j.workspace_id = $${values.length}`); }
     if (jobId) { values.push(jobId); where.push(`j.id = $${values.length}`); }
     const result = await client.query(
-      `SELECT j.id, j.workspace_id, j.experiment_id, j.dataset_id, j.payload, j.attempts
+      `SELECT j.id, j.workspace_id, j.experiment_id, j.dataset_id, j.payload, j.attempts, j.max_attempts
          FROM analysis_jobs j
         WHERE ${where.join(' AND ')}
         ORDER BY j.created_at ASC
@@ -293,8 +298,12 @@ async function claimJob(pool, { workspaceId = null, jobId = null } = {}) {
     }
     const job = result.rows[0];
     await client.query(
-      `UPDATE analysis_jobs SET status = 'running', attempts = attempts + 1, started_at = now(), updated_at = now() WHERE id = $1`,
-      [job.id],
+      `UPDATE analysis_jobs
+          SET status = 'running', attempts = attempts + 1, started_at = coalesce(started_at, now()),
+              lease_expires_at = now() + interval '10 minutes', worker_id = $2,
+              last_heartbeat_at = now(), updated_at = now()
+        WHERE id = $1`,
+      [job.id, `worker-${process.pid}`],
     );
     await client.query(
       `UPDATE experiments SET status = 'running', updated_at = now() WHERE id = $1`,

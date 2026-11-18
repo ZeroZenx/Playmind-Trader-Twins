@@ -9,13 +9,16 @@ The current Next.js API exposes these routes. The original contract below stays 
 | GET/PATCH | `/api/onboarding` | Read or update onboarding tasks |
 | GET/POST | `/api/datasets` | List or create dataset metadata |
 | POST | `/api/datasets/:id/upload` | Upload a batch file |
+| POST | `/api/datasets/:id/upload-token` | Create an authenticated private Blob client-upload token |
+| POST | `/api/datasets/:id/upload/complete` | Verify the private object and queue ingestion |
 | POST | `/api/datasets/:id/validate` | Validate the dataset |
 | GET/POST | `/api/experiments` | List or create a draft experiment |
 | POST | `/api/experiments/:id/run` | Queue a held-out twin and policy analysis |
 | GET | `/api/experiments/:id` | Read job status, results, and the saved report |
-| POST | `/api/jobs/process` | Process one queued analysis job for the current workspace |
+| GET/POST | `/api/jobs/process` | Process one queued ingestion or analysis job. Production requests require `Authorization: Bearer $CRON_SECRET`. Local development permits an authenticated owner or analyst. |
 | GET | `/api/reports` | List evidence reports |
 | GET | `/api/reports/:id` | Read a report JSON document |
+| POST | `/api/reports/:id/approve` | Approve a report for an owner or reviewer |
 | GET | `/api/venues` | List workspace venue capabilities |
 | GET | `/api/venues/polymarket/markets` | Read public Polymarket market metadata |
 

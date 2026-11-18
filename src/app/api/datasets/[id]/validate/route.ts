@@ -8,6 +8,7 @@ export const dynamic = "force-dynamic";
 export async function POST(_request: Request, { params }: { params: Promise<{ id: string }> }) {
   try {
     const context = await requireWorkspaceContext();
+    if (!["owner", "analyst"].includes(context.workspace.role)) throw new Error("FORBIDDEN");
     const { id } = await params;
     const result = await query(
       `WITH stats AS (
