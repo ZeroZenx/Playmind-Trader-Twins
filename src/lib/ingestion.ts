@@ -29,6 +29,9 @@ export const eventSchema = z.object({
   policy_event_type: z.string().nullable().optional(),
   policy_event_value: z.string().nullable().optional(),
   realized_result: z.coerce.number().finite().nullable().optional(),
+  placed_at: z.string().datetime({ offset: true }).nullable().optional(),
+  settled_at: z.string().datetime({ offset: true }).nullable().optional(),
+  provenance: z.record(z.string(), z.string()).nullable().optional(),
   source_row_number: z.coerce.number().int().positive(),
 });
 
@@ -57,12 +60,19 @@ function parseCsvLine(line: string) {
   return cells;
 }
 
+// The normalization normalizeField in src/engine/validate.mjs applies: trim, lowercase, and
+// whitespace to "_", so "Email Address" is checked as email_address. Used for the forbidden
+// headers only. Required columns still match after trim and lowercase only, so this never loosens a check.
+export function normalizeHeader(header: string) {
+  return header.trim().toLowerCase().replace(/\s+/g, "_");
+}
+
 export function parseTokenizedCsv(csv: string) {
   const lines = csv.split(/\r?\n/).filter((line) => line.trim().length > 0);
   if (!lines.length) throw new Error("CSV is empty");
   const headers = parseCsvLine(lines[0]).map((header) => header.trim());
   const normalizedHeaders = headers.map((header) => header.toLowerCase());
-  const prohibited = normalizedHeaders.filter((header) => forbidden.has(header));
+  const prohibited = [...new Set(headers.map(normalizeHeader).filter((header) => forbidden.has(header)))];
   if (prohibited.length) throw new Error(`Direct PII fields are prohibited: ${prohibited.join(", ")}`);
   const missing = requiredHeaders.filter((header) => !normalizedHeaders.includes(header));
   if (missing.length) throw new Error(`Required columns are missing: ${missing.join(", ")}`);

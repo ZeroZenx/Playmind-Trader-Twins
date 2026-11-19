@@ -1,5 +1,13 @@
+/**
+ * The baseline-0.1 policy layer: policies delete or cap trades in simulateTwin, whose
+ * stakes don't depend on outcomes, with no response assumptions. Kept so reports can
+ * compare; comparePolicy's output is labelled simulatorVersion 'baseline-0.1'. The
+ * policy-0.2.0 layer, with explicit response assumptions on simulateTwinV2, is
+ * policy-sim.mjs (ADR-013).
+ */
 import { simulateTwin } from './twin.mjs';
 
+const BASELINE_VERSION = 'baseline-0.1';
 const POLICY_TYPES = new Set(['cooldown', 'deposit_limit', 'stake_limit']);
 
 export function validatePolicy(policy) {
@@ -43,6 +51,7 @@ export function comparePolicy(twins, policy, options = {}) {
   });
 
   return {
+    simulatorVersion: BASELINE_VERSION,
     policy,
     horizonDays,
     results,

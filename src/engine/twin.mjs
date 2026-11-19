@@ -55,7 +55,7 @@ function chooseMarket(marketMix, rng) {
 
 function policyBlocksTrade(policy, state, proposedStake, eventTime) {
   if (!policy) return null;
-  if (policy.type === 'stake_limit' && proposedStake > policy.maxStake) return 'stake_limit';
+  // stake_limit never blocks: it caps the stake at maxStake below.
   if (policy.type === 'cooldown' && state.cooldownUntil && eventTime < state.cooldownUntil) return 'cooldown';
   return null;
 }
@@ -117,6 +117,7 @@ export function simulateTwin(twin, options = {}) {
       }
 
       const stake = policy?.type === 'stake_limit' ? Math.min(proposedStake, policy.maxStake) : proposedStake;
+      if (stake < proposedStake) policyTriggers += 1;
       const adjustedResult = stake === proposedStake
         ? realizedResult
         : roundMoney(realizedResult * (stake / proposedStake));
@@ -157,6 +158,11 @@ export function simulateTwin(twin, options = {}) {
   };
 }
 
+/**
+ * Same-window mechanics check, not validation: it compares baseline-0.1 simulated totals
+ * with the window the profile was built from. Held-out validation is runHoldoutValidation
+ * in holdout.mjs (ADR-014).
+ */
 export function validateTwin(twin, observedSignal, simulatedResult) {
   const comparisons = [
     ['tradeCount', observedSignal.tradeCount, simulatedResult.tradeCount],
@@ -171,7 +177,8 @@ export function validateTwin(twin, observedSignal, simulatedResult) {
   return {
     twinId: twin.twinId,
     status: 'synthetic-baseline-check',
+    checkType: 'same-window mechanics check (not validation)',
     comparisons,
-    note: 'Synthetic replay is a mechanics check. It is not proof of production model performance.'
+    note: 'Same-window mechanics check: the simulated totals are compared with the window the profile was built from, so this validates nothing. Held-out validation is runHoldoutValidation (holdout.mjs). It is not proof of production model performance.'
   };
 }

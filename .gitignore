@@ -8,3 +8,19 @@ analysis/cache/
 __pycache__/
 *.pyc
 .DS_Store
+
+# Customer data boundary: never commit customer data, raw or derived.
+data/
+*.parquet
+
+# Demo output (npm run demo): report v2 holds held-out validation results, which stay local.
+demo/output/
+
+# CSV files are ignored everywhere except synthetic fixtures.
+*.csv
+!test/fixtures/**/*.csv
+
+# Environment files: only the example is tracked.
+.env
+.env.*
+!.env.example

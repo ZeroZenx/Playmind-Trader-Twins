@@ -1,0 +1,31 @@
+{
+  "name": "fixture-ledger",
+  "label": "SYNTHETIC",
+  "description": "Example mapping for the SYNTHETIC ledger fixture (ledger-export.csv). For a real export, copy this under data/ and edit it there: a config for customer data stays out of the repo.",
+  "input": "ledger-export.csv",
+  "source": { "format": "csv", "commentPrefix": "#" },
+  "venueId": "fixture-exchange",
+  "trader": { "column": "account_ref", "tokenPrefix": "tr_", "tokenHexLength": 16, "caseSensitive": true },
+  "eventId": { "column": "entry_id" },
+  "timestamp": { "column": "posted_at_utc", "timezone": "UTC", "format": "iso" },
+  "eventType": {
+    "column": "entry_type",
+    "values": { "BET": "trade", "DEPOSIT": "deposit", "WITHDRAWAL": "withdrawal" },
+    "ignore": ["FEE"],
+    "caseSensitive": false
+  },
+  "fields": {
+    "stake_amount": { "column": "stake_cents", "units": "cents" },
+    "deposit_amount": { "column": "amount_cents", "units": "cents", "appliesTo": ["deposit"] },
+    "withdrawal_amount": { "column": "amount_cents", "units": "cents", "sign": "absolute", "appliesTo": ["withdrawal"] },
+    "realized_result": {
+      "mode": "split",
+      "gainColumn": "settle_credit_cents",
+      "lossColumn": "settle_debit_cents",
+      "units": "cents",
+      "lossSign": "positive"
+    }
+  },
+  "excludeRows": [],
+  "dropExactDuplicates": true
+}
